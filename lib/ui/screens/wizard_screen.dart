@@ -1,0 +1,559 @@
+import 'package:flutter/material.dart';
+import '../../state/app_controller.dart';
+import '../theme/app_theme.dart';
+import '../widgets/radar_profile_chart.dart';
+
+class _WizardStepInfo {
+  final int index;
+  final String title;
+  final String subtitle;
+  final String promptText;
+  final String targetFeature;
+
+  const _WizardStepInfo({
+    required this.index,
+    required this.title,
+    required this.subtitle,
+    required this.promptText,
+    required this.targetFeature,
+  });
+}
+
+/// Màn hình Chuỗi 4 Bước Thu & Phân Tích Đặc Trưng Giọng Nói của người dùng
+class VoiceProfilingWizardScreen extends StatefulWidget {
+  final AppController controller;
+  final VoidCallback onJumpToStudio;
+
+  const VoiceProfilingWizardScreen({
+    super.key,
+    required this.controller,
+    required this.onJumpToStudio,
+  });
+
+  @override
+  State<VoiceProfilingWizardScreen> createState() =>
+      _VoiceProfilingWizardScreenState();
+}
+
+class _VoiceProfilingWizardScreenState
+    extends State<VoiceProfilingWizardScreen> {
+  int _activeStep = 0;
+
+  static const List<_WizardStepInfo> _steps = [
+    _WizardStepInfo(
+      index: 0,
+      title: 'Bước 1: Đo Tạp Âm Phòng & Giọng Nói Tự Nhiên',
+      subtitle: 'Giữ im lặng 1 giây rồi đọc to câu bên dưới ở âm lượng bình thường',
+      promptText:
+          '"Xin chào, hôm nay tôi thử giọng để hệ thống cân chỉnh âm thanh Karaoke phù hợp nhất."',
+      targetFeature: 'Trích xuất: Noise Floor (dB), F0 trung bình & Trọng tâm phổ (Spectral Centroid)',
+    ),
+    _WizardStepInfo(
+      index: 1,
+      title: 'Bước 2: Đo Quãng Giọng (Pitch Range Glide)',
+      subtitle: 'Ngân âm "Aaaa..." trượt từ nốt trầm nhất lên nốt cao nhất mà bạn thấy thoải mái',
+      promptText: '"Aaaaaaaa... (Trầm -> Trung -> Cao)"',
+      targetFeature: 'Trích xuất: Quãng giọng (Bass/Baritone/Tenor/Alto/Soprano) & Vùng giọng đẹp nhất',
+    ),
+    _WizardStepInfo(
+      index: 2,
+      title: 'Bước 3: Độ Ổn Định Hơi & Cao Độ (Sustained Note)',
+      subtitle: 'Ngân dài 1 nốt nhạc đều hơi trong khoảng 4 - 5 giây',
+      promptText: '"Laaaaaaaa..." (Giữ thẳng cao độ và đều hơi)',
+      targetFeature: 'Trích xuất: Độ lệch cao độ (Pitch Jitter %) để tính lực kéo Auto-Tune & Compressor',
+    ),
+    _WizardStepInfo(
+      index: 3,
+      title: 'Bước 4: Đo Âm Xì (Sibilance) & Đường Cong Bù 5-Band EQ',
+      subtitle: 'Hát hoặc đọc rõ câu có nhiều phụ âm s, x, ch, t để đo tần số chói mic',
+      promptText:
+          '"Sóng xô bờ cát sáng, tiếng chim ca vang khắp chốn xa xôi..."',
+      targetFeature: 'Trích xuất: Đỉnh Sibilance (5kHz-8kHz) cho De-esser & Đường cong bù 5-Band EQ',
+    ),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    final ctrl = widget.controller;
+    final step = _steps[_activeStep];
+    final metrics = ctrl.wizardSteps[_activeStep];
+    final completedCount = ctrl.wizardSteps.where((e) => e != null).length;
+
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
+      children: [
+        // Thẻ Hồ sơ giọng hiện tại + Biểu đồ Radar 5 cạnh
+        _buildProfileSummaryCard(ctrl, completedCount),
+        const SizedBox(height: 16),
+
+        // Thanh tiến trình chọn 4 bước
+        Row(
+          children: List.generate(_steps.length, (idx) {
+            final bool isCurrent = idx == _activeStep;
+            final bool isDone = ctrl.wizardSteps[idx] != null;
+            return Expanded(
+              child: GestureDetector(
+                onTap: () => setState(() => _activeStep = idx),
+                child: Container(
+                  margin: EdgeInsets.only(right: idx < 3 ? 8 : 0),
+                  padding: const EdgeInsets.symmetric(vertical: 10),
+                  decoration: BoxDecoration(
+                    color: isCurrent
+                        ? AppTheme.primaryNeon
+                        : (isDone
+                            ? AppTheme.accentEmerald.withValues(alpha: 0.2)
+                            : AppTheme.cardDark),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                      color: isCurrent
+                          ? AppTheme.accentCyan
+                          : (isDone
+                              ? AppTheme.accentEmerald
+                              : Colors.white.withValues(alpha: 0.1)),
+                    ),
+                  ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(
+                        isDone ? Icons.check_circle : Icons.mic_none,
+                        size: 15,
+                        color: isDone ? AppTheme.accentEmerald : Colors.white,
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        'Bước ${idx + 1}',
+                        style: const TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          }),
+        ),
+        const SizedBox(height: 14),
+
+        // Thẻ thực hành Bước hiện tại
+        Container(
+          padding: const EdgeInsets.all(18),
+          decoration: BoxDecoration(
+            color: AppTheme.cardDark,
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(color: Colors.white.withValues(alpha: 0.1)),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                step.title,
+                style: const TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.w800,
+                  color: AppTheme.accentCyan,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                step.subtitle,
+                style: const TextStyle(
+                  fontSize: 13,
+                  color: AppTheme.textSecondary,
+                ),
+              ),
+              const SizedBox(height: 14),
+
+              // Hộp câu mẫu để người dùng đọc/hát
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: AppTheme.bgDark,
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(
+                    color: AppTheme.primaryNeon.withValues(alpha: 0.35),
+                  ),
+                ),
+                child: Column(
+                  children: [
+                    const Text(
+                      'MẪU THU ÂM:',
+                      style: TextStyle(
+                        fontSize: 10.5,
+                        fontWeight: FontWeight.w700,
+                        color: AppTheme.accentAmber,
+                        letterSpacing: 1.0,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      step.promptText,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w700,
+                        fontStyle: FontStyle.italic,
+                        color: Colors.white,
+                        height: 1.35,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 12),
+              Text(
+                step.targetFeature,
+                style: const TextStyle(
+                  fontSize: 11.5,
+                  color: AppTheme.textSecondary,
+                ),
+              ),
+              const SizedBox(height: 16),
+
+              // Thanh đo mức âm lượng Mic trực tiếp khi đang thu
+              if (ctrl.isRecordingWizard) ...[
+                _buildLiveMicMeter(ctrl.liveMicAmplitudeDb),
+                const SizedBox(height: 14),
+              ],
+
+              // Hàng nút Thu âm bằng Mic hoặc Giả lập mẫu thử nhanh
+              Row(
+                children: [
+                  Expanded(
+                    flex: 3,
+                    child: FilledButton.icon(
+                      style: FilledButton.styleFrom(
+                        backgroundColor: ctrl.isRecordingWizard
+                            ? AppTheme.accentRose
+                            : AppTheme.primaryNeon,
+                        padding: const EdgeInsets.symmetric(vertical: 13),
+                      ),
+                      onPressed: ctrl.isBusyProcessing
+                          ? null
+                          : () async {
+                              if (ctrl.isRecordingWizard) {
+                                await ctrl.stopWizardStepRecording(_activeStep);
+                              } else {
+                                await ctrl.startWizardStepRecording(_activeStep);
+                              }
+                            },
+                      icon: Icon(
+                        ctrl.isRecordingWizard
+                            ? Icons.stop_circle_outlined
+                            : Icons.mic_rounded,
+                      ),
+                      label: Text(
+                        ctrl.isRecordingWizard
+                            ? 'Dừng & Phân Tích Ngay'
+                            : 'Thu Âm Bước ${_activeStep + 1}',
+                        style: const TextStyle(fontWeight: FontWeight.w700),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    flex: 2,
+                    child: OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(vertical: 13),
+                        side: BorderSide(
+                          color: AppTheme.accentCyan.withValues(alpha: 0.5),
+                        ),
+                      ),
+                      onPressed: (ctrl.isBusyProcessing || ctrl.isRecordingWizard)
+                          ? null
+                          : () => ctrl.simulateWizardStepAnalysis(_activeStep),
+                      icon: const Icon(Icons.science_outlined, size: 18),
+                      label: const Text(
+                        'Giả lập mẫu',
+                        style: TextStyle(fontSize: 12.5),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+
+              // Hiển thị kết quả đo của bước này nếu đã đo xong
+              if (metrics != null) ...[
+                const SizedBox(height: 16),
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: AppTheme.accentEmerald.withValues(alpha: 0.1),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                      color: AppTheme.accentEmerald.withValues(alpha: 0.4),
+                    ),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          const Icon(
+                            Icons.verified_rounded,
+                            color: AppTheme.accentEmerald,
+                            size: 18,
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            'Kết quả trích xuất Bước ${_activeStep + 1}:',
+                            style: const TextStyle(
+                              fontWeight: FontWeight.w700,
+                              color: AppTheme.accentEmerald,
+                              fontSize: 13,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      Wrap(
+                        spacing: 12,
+                        runSpacing: 6,
+                        children: [
+                          _metricTag(
+                            'F0 Trung bình',
+                            '${metrics.meanPitchHz.toStringAsFixed(1)} Hz',
+                          ),
+                          _metricTag(
+                            'Dải Pitch',
+                            '${metrics.minPitchHz.round()} - ${metrics.maxPitchHz.round()} Hz',
+                          ),
+                          _metricTag(
+                            'Độ lệch Pitch (Jitter)',
+                            '${metrics.pitchJitterPercent.toStringAsFixed(2)}%',
+                          ),
+                          _metricTag(
+                            'Độ sáng phổ',
+                            '${metrics.spectralCentroidHz.round()} Hz',
+                          ),
+                          _metricTag(
+                            'Đỉnh âm xì',
+                            '${(metrics.sibilancePeakHz / 1000).toStringAsFixed(1)} kHz',
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+
+              const SizedBox(height: 14),
+              // Nút chuyển bước tiếp theo hoặc Hoàn tất Hồ sơ giọng
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  if (_activeStep > 0)
+                    TextButton.icon(
+                      onPressed: () => setState(() => _activeStep--),
+                      icon: const Icon(Icons.arrow_back_ios_new, size: 14),
+                      label: const Text('Bước trước'),
+                    )
+                  else
+                    const SizedBox.shrink(),
+                  if (_activeStep < 3)
+                    FilledButton.tonalIcon(
+                      onPressed: () => setState(() => _activeStep++),
+                      icon: const Icon(Icons.arrow_forward_ios, size: 14),
+                      label: Text('Sang Bước ${_activeStep + 2}'),
+                    )
+                  else
+                    FilledButton.icon(
+                      style: FilledButton.styleFrom(
+                        backgroundColor: AppTheme.accentEmerald,
+                        foregroundColor: Colors.black,
+                      ),
+                      onPressed: ctrl.isBusyProcessing
+                          ? null
+                          : () async {
+                              await ctrl.finalizeVoiceProfileFromWizard();
+                              widget.onJumpToStudio();
+                            },
+                      icon: const Icon(Icons.check_circle_outline),
+                      label: const Text(
+                        'Hoàn Tất & Chuyển Sang Studio Karaoke',
+                        style: TextStyle(fontWeight: FontWeight.w800),
+                      ),
+                    ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildProfileSummaryCard(AppController ctrl, int completedCount) {
+    final profile = ctrl.voiceProfile;
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: AppTheme.cardDark,
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 3,
+                          ),
+                          decoration: BoxDecoration(
+                            color: AppTheme.accentCyan.withValues(alpha: 0.18),
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          child: Text(
+                            ctrl.hasCustomProfile
+                                ? 'ĐÃ ĐO CÁ NHÂN HÓA'
+                                : 'HỒ SƠ MẪU SẴN SÀNG ($completedCount/4 BƯỚC)',
+                            style: const TextStyle(
+                              fontSize: 10.5,
+                              fontWeight: FontWeight.w800,
+                              color: AppTheme.accentCyan,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      profile.vocalType.title,
+                      style: const TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w800,
+                        color: Colors.white,
+                      ),
+                    ),
+                    Text(
+                      'Dải tần số: ${profile.minPitchHz.round()}Hz – ${profile.maxPitchHz.round()}Hz • Vùng giọng đẹp: ~${profile.comfortZoneHz.round()}Hz',
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: AppTheme.textSecondary,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              FilledButton.tonal(
+                onPressed: ctrl.isBusyProcessing
+                    ? null
+                    : () async {
+                        await ctrl.finalizeVoiceProfileFromWizard();
+                        widget.onJumpToStudio();
+                      },
+                child: const Text(
+                  'Áp dụng ngay',
+                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Center(child: RadarProfileChart(profile: profile, size: 215)),
+          const SizedBox(height: 6),
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: AppTheme.cardElevated,
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Icon(
+                  Icons.psychology_alt_rounded,
+                  color: AppTheme.accentCyan,
+                  size: 20,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    profile.aiSummary,
+                    style: const TextStyle(
+                      fontSize: 12.2,
+                      color: AppTheme.textPrimary,
+                      height: 1.38,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLiveMicMeter(double db) {
+    final double norm = ((db + 60.0) / 60.0).clamp(0.05, 1.0);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            const Text(
+              'Mức tín hiệu Microphone trực tiếp:',
+              style: TextStyle(fontSize: 12, color: AppTheme.accentAmber),
+            ),
+            Text(
+              '${db.toStringAsFixed(1)} dBFS',
+              style: const TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+                color: Colors.white,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        ClipRRect(
+          borderRadius: BorderRadius.circular(8),
+          child: LinearProgressIndicator(
+            value: norm,
+            minHeight: 8,
+            backgroundColor: Colors.white.withValues(alpha: 0.1),
+            valueColor: const AlwaysStoppedAnimation<Color>(
+              AppTheme.accentEmerald,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _metricTag(String label, String val) {
+    return RichText(
+      text: TextSpan(
+        style: const TextStyle(fontSize: 12),
+        children: [
+          TextSpan(
+            text: '$label: ',
+            style: const TextStyle(color: AppTheme.textSecondary),
+          ),
+          TextSpan(
+            text: val,
+            style: const TextStyle(
+              color: Colors.white,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
