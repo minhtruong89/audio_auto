@@ -269,13 +269,14 @@ class OnnxUvrSeparatorService {
     }
   }
 
-  /// Hậu xử lý khử nhiễu xì/rè trên kênh Vocal và triệt tiêu lượng Vocal rò rỉ nhỏ trên kênh Nhạc nền:
-  /// 1. Trên kênh Nhạc nền (Instrumental): Trong bản thu điện thoại/loa ngoài, âm lượng giọng hát thường lớn hơn
-  ///    so với bản thu phòng thu nên `input - vocals` vẫn còn sót ~12-18% biên độ giọng hát ở dải trung (250Hz-3800Hz).
-  ///    Ta tính tương quan năng lượng tức thời giữa `Vocal` và `Instrumental` để triệt tiêu tiếp phần giọng còn vương lại
-  ///    (Adaptive Residual Vocal Cancellation + Mid-Band Vocal Ducking).
-  /// 2. Trên kênh Giọng hát (Vocal): Cắt sạch nhiễu tần số cao > 7.8kHz (nguyên nhân gây tiếng "xì xì" do cắt cụt bin `dim_f` của MDX-Net)
-  ///    và áp bộ cổng mở mượt (Smooth Vocal Expander Gate) để tắt hẳn tiếng xì nền khi ca sĩ nghỉ lấy hơi.
+  /// Hậu xử lý STFT Wiener Soft-Masking (Không làm lệch pha, không bị tiếng vang/rè):
+  /// 1. Trên kênh Nhạc nền (Instrumental): Trong bản thu điện thoại/loa ngoài, giọng hát thu gần mic thường lớn hơn
+  ///    chuẩn phòng thu nên phép trừ mặc định của model vẫn để sót ~12-20% bóng giọng (vocal ghosting).
+  ///    Ta chạy STFT 1024-điểm (75% Overlap-Add) tính mặt nạ Wiener mềm theo từng bin tần số: tại những điểm
+  ///    tần số-thời gian mà năng lượng Vocal chiếm ưu thế trong dải 120Hz - 5.2kHz, ta dìm thêm phần rò rỉ trên kênh Nhạc,
+  ///    nhưng vẫn giữ nguyên 100% tiếng Bass và nhạc cụ.
+  /// 2. Trên kênh Giọng hát (Vocal): Lọc bỏ tạp âm nhạc nền lọt nhẹ bằng Wiener mask nhẹ, cắt nhiễu siêu cao > 9.5kHz
+  ///    (giữ nguyên độ trong tự nhiên của giọng mà không bị xì gắt) và đóng mượt Noise Gate khi nghỉ lấy hơi.
   SeparatedStems _postProcessCleanStems({
     required PcmAudioData input,
     required PcmAudioData rawVocal,
@@ -289,35 +290,17 @@ class OnnxUvrSeparatorService {
     final Float64List mL = Float64List.fromList(rawInst.leftChannel);
     final Float64List mR = Float64List.fromList(rawInst.rightChannel);
 
-    // 1. Tính hệ số tương quan chiếu (Least-Squares Residual Projection alpha) trên vùng giọng hát (300Hz-3400Hz)
-    // để xem trong kênh Music còn dính bao nhiêu % biên độ của kênh Vocal
-    double dotVM = 0.0;
-    double dotVV = 1e-9;
-    for (int i = 0; i < n; i += 2) {
-      final double vMid = 0.5 * (vL[i] + vR[i]);
-      final double mMid = 0.5 * (mL[i] + mR[i]);
-      if (vMid.abs() > 0.025) {
-        dotVM += vMid * mMid;
-        dotVV += vMid * vMid;
-      }
+    // 1. Áp dụng STFT Wiener Soft-Masking cho kênh Left và kênh Right để rút sạch bóng Vocal khỏi Music
+    if (n >= 2048) {
+      _applyStftWienerCleanup(vL, mL, sr);
+      _applyStftWienerCleanup(vR, mR, sr);
     }
-    // Hệ số rò rỉ giọng còn sót trong nhạc nền (thường từ 0.08 -> 0.28 trên file quay bằng điện thoại)
-    final double residualAlpha = (dotVM / dotVV).clamp(0.0, 0.35) + 0.14;
 
-    // Bộ lọc dải tần giọng hát (Vocal Presence Band 280Hz - 3600Hz) để chỉ rút thêm giọng khỏi nhạc nền ở dải trung
-    // mà giữ nguyên 100% tiếng Bass và tiếng Treble của nhạc cụ!
-    final vocalBandFilterL = _SimpleBiquad.bandPass(sr, 1150.0, 0.65);
-    final vocalBandFilterR = _SimpleBiquad.bandPass(sr, 1150.0, 0.65);
-
-    // Bộ lọc khử tiếng xì gắt (Anti-Hiss Low-Pass 7600Hz + High-Pass 95Hz) cho kênh Vocal
-    final vocalLpL = _SimpleBiquad.lowPass(sr, 7600.0, 0.707);
-    final vocalLpR = _SimpleBiquad.lowPass(sr, 7600.0, 0.707);
-    final vocalHpL = _SimpleBiquad.highPass(sr, 95.0, 0.707);
-    final vocalHpR = _SimpleBiquad.highPass(sr, 95.0, 0.707);
-
-    // Bộ lọc làm ấm nhẹ dải cao của kênh Music khi bị trừ giọng
-    final musicPresenceDipL = _SimpleBiquad.peaking(sr, 1650.0, 0.9, -3.5);
-    final musicPresenceDipR = _SimpleBiquad.peaking(sr, 1650.0, 0.9, -3.5);
+    // 2. Làm sạch tiếng xì siêu cao tần (> 9.5kHz) & ù (< 85Hz) và đóng cổng mượt khi ngừng hát
+    final vocalLpL = _SimpleBiquad.lowPass(sr, 9500.0, 0.707);
+    final vocalLpR = _SimpleBiquad.lowPass(sr, 9500.0, 0.707);
+    final vocalHpL = _SimpleBiquad.highPass(sr, 85.0, 0.707);
+    final vocalHpR = _SimpleBiquad.highPass(sr, 85.0, 0.707);
 
     double vocalEnv = 0.0;
     double gateGain = 0.0;
@@ -326,7 +309,6 @@ class OnnxUvrSeparatorService {
       double vl = vL[i];
       double vr = vR[i];
 
-      // Đo bao hình năng lượng giọng hát (Envelope Follower)
       final double vAbs = 0.5 * (vl.abs() + vr.abs());
       if (vAbs > vocalEnv) {
         vocalEnv = 0.985 * vocalEnv + 0.015 * vAbs;
@@ -334,37 +316,18 @@ class OnnxUvrSeparatorService {
         vocalEnv = 0.9992 * vocalEnv + 0.0008 * vAbs;
       }
 
-      // A. Làm sạch kênh Vocal:
-      // - Khi ca sĩ không hát (vocalEnv < 0.012), đóng mượt cổng âm thanh xuống 0 để triệt tiêu hoàn toàn tiếng xì nền
-      final double targetGate = vocalEnv < 0.010
+      final double targetGate = vocalEnv < 0.008
           ? 0.0
-          : ((vocalEnv - 0.010) / 0.022).clamp(0.0, 1.0);
+          : ((vocalEnv - 0.008) / 0.020).clamp(0.0, 1.0);
       gateGain = 0.995 * gateGain + 0.005 * targetGate;
 
-      // - Lọc sạch nhiễu cao tần (>7.6kHz) và ù trầm (<95Hz) gây rè/xì
       vl = vocalLpL.process(vocalHpL.process(vl)) * gateGain;
       vr = vocalLpR.process(vocalHpR.process(vr)) * gateGain;
       vL[i] = vl.clamp(-0.98, 0.98);
       vR[i] = vr.clamp(-0.98, 0.98);
 
-      // B. Triệt tiêu tiếng giọng hát nhỏ còn lẫn trong kênh Nhạc nền (Music Solo):
-      // - Trừ phần giọng rò rỉ trong dải tần trung (280Hz - 3600Hz)
-      final double vMidBandL = vocalBandFilterL.process(vl);
-      final double vMidBandR = vocalBandFilterR.process(vr);
-
-      double ml = mL[i] - vMidBandL * residualAlpha;
-      double mr = mR[i] - vMidBandR * residualAlpha;
-
-      // - Khi đang có giọng hát lớn (vocalEnv > 0.02), nén nhẹ dải Mid 1.6kHz của nhạc nền đi một chút
-      //   để triệt tiêu nốt phần bóng giọng (vocal ghosting) còn sót lại
-      final double dipBlend = (vocalEnv * 4.5).clamp(0.0, 0.85);
-      final double dippedL = musicPresenceDipL.process(ml);
-      final double dippedR = musicPresenceDipR.process(mr);
-      ml = ml * (1.0 - dipBlend) + dippedL * dipBlend;
-      mr = mr * (1.0 - dipBlend) + dippedR * dipBlend;
-
-      mL[i] = ml.clamp(-0.98, 0.98);
-      mR[i] = mr.clamp(-0.98, 0.98);
+      mL[i] = mL[i].clamp(-0.98, 0.98);
+      mR[i] = mR[i].clamp(-0.98, 0.98);
     }
 
     return SeparatedStems(
@@ -382,6 +345,164 @@ class OnnxUvrSeparatorService {
       ),
       usedAiOnnxModel: true,
     );
+  }
+
+  /// Làm sạch song song 2 luồng Vocal và Music bằng STFT Wiener Soft-Masking (1024-pt FFT, hop 256)
+  void _applyStftWienerCleanup(Float64List vBuf, Float64List mBuf, int sr) {
+    final int n = vBuf.length;
+    const int fftSize = 1024;
+    const int hopSize = 256;
+    const int numBins = fftSize ~/ 2 + 1;
+    final double binFreq = sr / fftSize;
+
+    final Float64List window = Float64List(fftSize);
+    for (int i = 0; i < fftSize; i++) {
+      window[i] = 0.5 * (1.0 - math.cos(2.0 * math.pi * i / fftSize));
+    }
+
+    final Float64List vOut = Float64List(n);
+    final Float64List mOut = Float64List(n);
+    final Float64List winNorm = Float64List(n);
+
+    final Float64List vRe = Float64List(fftSize);
+    final Float64List vIm = Float64List(fftSize);
+    final Float64List mRe = Float64List(fftSize);
+    final Float64List mIm = Float64List(fftSize);
+    final Float64List prevMusicMask = Float64List(numBins)..fillRange(0, numBins, 1.0);
+    final Float64List prevVocalMask = Float64List(numBins)..fillRange(0, numBins, 1.0);
+
+    for (int start = 0; start + fftSize <= n; start += hopSize) {
+      for (int i = 0; i < fftSize; i++) {
+        final double w = window[i];
+        vRe[i] = vBuf[start + i] * w;
+        vIm[i] = 0.0;
+        mRe[i] = mBuf[start + i] * w;
+        mIm[i] = 0.0;
+      }
+
+      _fftRadix2(vRe, vIm, false);
+      _fftRadix2(mRe, mIm, false);
+
+      for (int b = 0; b < numBins; b++) {
+        final double freq = b * binFreq;
+        final double vPow = vRe[b] * vRe[b] + vIm[b] * vIm[b];
+        final double mPow = mRe[b] * mRe[b] + mIm[b] * mIm[b];
+
+        // 1. Mặt nạ dìm phần giọng hát rò rỉ trong kênh Nhạc nền (tập trung dải giọng 120Hz - 5200Hz)
+        double targetMusicMask = 1.0;
+        if (freq >= 120.0 && freq <= 5500.0 && vPow > 1e-7) {
+          final double suppressionFactor =
+              (freq >= 240.0 && freq <= 3800.0) ? 3.2 : 1.8;
+          targetMusicMask =
+              (mPow / (mPow + suppressionFactor * vPow + 1e-8)).clamp(0.06, 1.0);
+        }
+
+        // 2. Mặt nạ lọc nhẹ tạp âm nhạc nền rò rỉ vào kênh Giọng hát (không cắt gắt để giữ giọng trong tự nhiên)
+        double targetVocalMask = 1.0;
+        if (freq < 90.0 || freq > 10500.0) {
+          targetVocalMask = 0.08;
+        } else if (mPow > 1e-7) {
+          targetVocalMask =
+              (vPow / (vPow + 0.28 * mPow + 1e-8)).clamp(0.12, 1.0);
+        }
+
+        // Làm mượt mặt nạ theo thời gian để không có tiếng lạo xạo (Zero musical noise)
+        final double smoothM =
+            0.45 * prevMusicMask[b] + 0.55 * targetMusicMask;
+        final double smoothV =
+            0.45 * prevVocalMask[b] + 0.55 * targetVocalMask;
+        prevMusicMask[b] = smoothM;
+        prevVocalMask[b] = smoothV;
+
+        vRe[b] *= smoothV;
+        vIm[b] *= smoothV;
+        mRe[b] *= smoothM;
+        mIm[b] *= smoothM;
+
+        if (b > 0 && b < numBins - 1) {
+          vRe[fftSize - b] = vRe[b];
+          vIm[fftSize - b] = -vIm[b];
+          mRe[fftSize - b] = mRe[b];
+          mIm[fftSize - b] = -mIm[b];
+        }
+      }
+
+      _fftRadix2(vRe, vIm, true);
+      _fftRadix2(mRe, mIm, true);
+
+      for (int i = 0; i < fftSize; i++) {
+        final double w = window[i];
+        vOut[start + i] += vRe[i] * w;
+        mOut[start + i] += mRe[i] * w;
+        winNorm[start + i] += w * w;
+      }
+    }
+
+    for (int i = 0; i < n; i++) {
+      final double norm = winNorm[i];
+      if (norm > 1e-5) {
+        vBuf[i] = vOut[i] / norm;
+        mBuf[i] = mOut[i] / norm;
+      }
+    }
+  }
+
+  void _fftRadix2(Float64List re, Float64List im, bool inverse) {
+    final int n = re.length;
+    int j = 0;
+    for (int i = 0; i < n; i++) {
+      if (i < j) {
+        final double tr = re[i];
+        re[i] = re[j];
+        re[j] = tr;
+        final double ti = im[i];
+        im[i] = im[j];
+        im[j] = ti;
+      }
+      int m = n >> 1;
+      while (m >= 1 && j >= m) {
+        j -= m;
+        m >>= 1;
+      }
+      j += m;
+    }
+
+    for (int len = 2; len <= n; len <<= 1) {
+      final int halfLen = len >> 1;
+      final double angle = (inverse ? 2.0 : -2.0) * math.pi / len;
+      final double wLenRe = math.cos(angle);
+      final double wLenIm = math.sin(angle);
+
+      for (int i = 0; i < n; i += len) {
+        double wRe = 1.0;
+        double wIm = 0.0;
+        for (int k = 0; k < halfLen; k++) {
+          final int evenIdx = i + k;
+          final int oddIdx = i + k + halfLen;
+
+          final double uRe = re[evenIdx];
+          final double uIm = im[evenIdx];
+          final double vRe = re[oddIdx] * wRe - im[oddIdx] * wIm;
+          final double vIm = re[oddIdx] * wIm + im[oddIdx] * wRe;
+
+          re[evenIdx] = uRe + vRe;
+          im[evenIdx] = uIm + vIm;
+          re[oddIdx] = uRe - vRe;
+          im[oddIdx] = uIm - vIm;
+
+          final double nextWRe = wRe * wLenRe - wIm * wLenIm;
+          wIm = wRe * wLenIm + wIm * wLenRe;
+          wRe = nextWRe;
+        }
+      }
+    }
+
+    if (inverse) {
+      for (int i = 0; i < n; i++) {
+        re[i] /= n;
+        im[i] /= n;
+      }
+    }
   }
 
   PcmAudioData _copyStemToPcm(SherpaOnnxSourceSeparationStem stem, int sr) {
@@ -451,35 +572,6 @@ class _SimpleBiquad {
       b0 / a0,
       (-2.0 * cosW) / a0,
       (1.0 - alpha) / a0,
-    );
-  }
-
-  factory _SimpleBiquad.bandPass(int sr, double freq, double q) {
-    final double w0 = 2.0 * math.pi * freq / sr;
-    final double cosW = math.cos(w0);
-    final double alpha = math.sin(w0) / (2.0 * q);
-    final double a0 = 1.0 + alpha;
-    return _SimpleBiquad(
-      alpha / a0,
-      0.0,
-      -alpha / a0,
-      (-2.0 * cosW) / a0,
-      (1.0 - alpha) / a0,
-    );
-  }
-
-  factory _SimpleBiquad.peaking(int sr, double freq, double q, double gainDb) {
-    final double a = math.pow(10.0, gainDb / 40.0).toDouble();
-    final double w0 = 2.0 * math.pi * freq / sr;
-    final double cosW = math.cos(w0);
-    final double alpha = math.sin(w0) / (2.0 * q);
-    final double a0 = 1.0 + alpha / a;
-    return _SimpleBiquad(
-      (1.0 + alpha * a) / a0,
-      (-2.0 * cosW) / a0,
-      (1.0 - alpha * a) / a0,
-      (-2.0 * cosW) / a0,
-      (1.0 - alpha / a) / a0,
     );
   }
 

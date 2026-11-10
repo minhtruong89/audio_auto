@@ -287,11 +287,12 @@ class DspEngineService {
       semitoneShift = (rawSemitoneDiff * 0.45 * convStrength).clamp(-3.0, 3.0);
     }
 
-    // 2. Thực hiện Dual-Grain Hann Window Pitch & Formant Shifting (không làm thay đổi tốc độ bài hát)
+    // 2. Thực hiện Dịch Quãng Giọng (Pitch Shift) đồng bộ pha WSOLA + Nội suy Cubic
+    // Loại bỏ hoàn toàn hiện tượng rung pha / tiếng kim loại của OLA thông thường
     if (semitoneShift.abs() >= 0.35) {
       final double pitchRatio =
           math.pow(2.0, semitoneShift / 12.0).toDouble().clamp(0.5, 2.0);
-      _olaPitchShiftInPlace(left, right, sr, pitchRatio);
+      _wsolaPitchShiftInPlace(left, right, sr, pitchRatio);
     }
 
     // 3. Áp dấu vân tay Vòm Họng (Vocal Tract Formant Fingerprint) theo F0 và Spectral Centroid của giọng đã lưu
@@ -323,66 +324,147 @@ class DspEngineService {
     );
   }
 
-  /// Bộ dịch cao độ thời gian thực Dual-Delay-Line Granular Pitch Shifter (bảo toàn thời lượng bài hát)
-  /// Kết hợp bộ lọc thông thấp khử răng cưa (Anti-Aliasing / Anti-Buzz LPF) để giọng sau khi dịch tông
-  /// hoàn toàn mượt, ấm, không bị rè hạt (grainy buzz) hay xì chói.
-  void _olaPitchShiftInPlace(
+  /// Bộ dịch cao độ chất lượng cao bằng **WSOLA (Waveform Similarity Overlap-Add) + Catmull-Rom Cubic Resampling**.
+  /// Thay vì ghép hạt cố định gây triệt tiêu pha & rung tiếng (~21Hz tremolo), WSOLA tìm điểm khớp tương quan
+  /// chéo cao nhất tại mỗi chu kỳ thanh quản để ghép sóng liền mạch tuyệt đối, giọng giữ nguyên độ trong và chắc.
+  void _wsolaPitchShiftInPlace(
     Float64List left,
     Float64List right,
     int sr,
     double pitchRatio,
   ) {
     final int n = left.length;
+    if (n < 2048 || (pitchRatio - 1.0).abs() < 0.005) return;
+
     final Float64List srcL = Float64List.fromList(left);
     final Float64List srcR = Float64List.fromList(right);
 
-    const int grainSize = 2048; // ~46.4ms tại 44.1kHz (mượt hơn, không bị rung rè ở giọng trầm)
-    final double rate = 1.0 - pitchRatio;
-    double phaseA = 0.0;
-    double phaseB = grainSize / 2.0;
+    const int winLen = 1024;
+    const int hopOut = 512; // 50% Hann overlap -> tổng cửa sổ đúng bằng 1.0
+    const int searchRadius = 220; // Quét ±5ms (bao phủ trọn vẹn chu kỳ F0 >= 100Hz)
 
-    // Bộ lọc khử răng cưa sau khi nội suy hạt (chống tiếng rè kim loại ở dải 6.5kHz+)
-    final double cutoffHz = pitchRatio > 1.0
-        ? (6800.0 / pitchRatio.clamp(1.0, 1.6)).clamp(4200.0, 6800.0)
-        : 6800.0;
-    final antiAliasLpL = _BiquadFilter.lowPass(sr, cutoffHz, 0.707);
-    final antiAliasLpR = _BiquadFilter.lowPass(sr, cutoffHz, 0.707);
+    final int stretchedLen = (n * pitchRatio).round().clamp(winLen, n * 2 + winLen);
+    final Float64List strL = Float64List(stretchedLen + winLen);
+    final Float64List strR = Float64List(stretchedLen + winLen);
+    final Float64List winNorm = Float64List(stretchedLen + winLen);
+
+    final Float64List hann = Float64List(winLen);
+    for (int i = 0; i < winLen; i++) {
+      hann[i] = 0.5 * (1.0 - math.cos(2.0 * math.pi * i / winLen));
+    }
+
+    int prevInStart = 0;
+    for (int outStart = 0; outStart < stretchedLen; outStart += hopOut) {
+      final int nomInStart =
+          (outStart / pitchRatio).round().clamp(0, math.max(0, n - winLen));
+
+      int bestInStart = nomInStart;
+      if (outStart > 0 && nomInStart > searchRadius && prevInStart + hopOut + winLen <= n) {
+        final int refStart = prevInStart + hopOut;
+        double refEnergy = 0.0;
+        for (int k = 0; k < hopOut; k += 4) {
+          final double r = 0.5 * (srcL[refStart + k] + srcR[refStart + k]);
+          refEnergy += r * r;
+        }
+
+        if (refEnergy > 1e-6) {
+          final int minSearch = math.max(0, nomInStart - searchRadius);
+          final int maxSearch = math.min(n - winLen, nomInStart + searchRadius);
+
+          // Tìm thô bước 4 mẫu
+          double bestScore = -1e18;
+          int coarseBest = nomInStart;
+          for (int cand = minSearch; cand <= maxSearch; cand += 4) {
+            double dot = 0.0;
+            double candE = 1e-9;
+            for (int k = 0; k < hopOut; k += 4) {
+              final double r = 0.5 * (srcL[refStart + k] + srcR[refStart + k]);
+              final double c = 0.5 * (srcL[cand + k] + srcR[cand + k]);
+              dot += r * c;
+              candE += c * c;
+            }
+            final double normScore = dot / math.sqrt(candE);
+            if (normScore > bestScore) {
+              bestScore = normScore;
+              coarseBest = cand;
+            }
+          }
+
+          // Tinh chỉnh chính xác từng mẫu quanh coarseBest ± 4
+          bestScore = -1e18;
+          final int fMin = math.max(minSearch, coarseBest - 4);
+          final int fMax = math.min(maxSearch, coarseBest + 4);
+          for (int cand = fMin; cand <= fMax; cand++) {
+            double dot = 0.0;
+            double candE = 1e-9;
+            for (int k = 0; k < hopOut; k += 2) {
+              final double r = 0.5 * (srcL[refStart + k] + srcR[refStart + k]);
+              final double c = 0.5 * (srcL[cand + k] + srcR[cand + k]);
+              dot += r * c;
+              candE += c * c;
+            }
+            final double normScore = dot / math.sqrt(candE);
+            if (normScore > bestScore) {
+              bestScore = normScore;
+              bestInStart = cand;
+            }
+          }
+        }
+      }
+
+      for (int i = 0; i < winLen; i++) {
+        final double w = hann[i];
+        final int srcIdx = bestInStart + i;
+        if (srcIdx < n) {
+          strL[outStart + i] += srcL[srcIdx] * w;
+          strR[outStart + i] += srcR[srcIdx] * w;
+          winNorm[outStart + i] += w;
+        }
+      }
+      prevInStart = bestInStart;
+    }
+
+    for (int i = 0; i < stretchedLen; i++) {
+      final double wn = winNorm[i];
+      if (wn > 1e-5) {
+        strL[i] /= wn;
+        strR[i] /= wn;
+      }
+    }
+
+    // Bước 2: Nội suy Catmull-Rom Cubic 4-điểm để trả về đúng n mẫu (bảo toàn 100% thời lượng bài hát)
+    final double maxPos = (stretchedLen - 3).toDouble();
+    final antiAliasLpL = pitchRatio > 1.08
+        ? _BiquadFilter.lowPass(sr, (8800.0 / pitchRatio).clamp(5200.0, 8800.0), 0.707)
+        : null;
+    final antiAliasLpR = pitchRatio > 1.08
+        ? _BiquadFilter.lowPass(sr, (8800.0 / pitchRatio).clamp(5200.0, 8800.0), 0.707)
+        : null;
 
     for (int i = 0; i < n; i++) {
-      phaseA += rate;
-      if (phaseA >= grainSize) phaseA -= grainSize;
-      if (phaseA < 0) phaseA += grainSize;
+      final double pos = (i * pitchRatio).clamp(1.0, maxPos);
+      final int idx = pos.floor();
+      final double t = pos - idx;
 
-      phaseB += rate;
-      if (phaseB >= grainSize) phaseB -= grainSize;
-      if (phaseB < 0) phaseB += grainSize;
+      double vL = _cubicInterp(strL[idx - 1], strL[idx], strL[idx + 1], strL[idx + 2], t);
+      double vR = _cubicInterp(strR[idx - 1], strR[idx], strR[idx + 1], strR[idx + 2], t);
 
-      final double winA =
-          0.5 * (1.0 - math.cos(2.0 * math.pi * phaseA / grainSize));
-      final double winB =
-          0.5 * (1.0 - math.cos(2.0 * math.pi * phaseB / grainSize));
+      if (antiAliasLpL != null && antiAliasLpR != null) {
+        vL = antiAliasLpL.process(vL);
+        vR = antiAliasLpR.process(vR);
+      }
 
-      final double posA = (i - phaseA).clamp(0.0, (n - 2).toDouble());
-      final double posB = (i - phaseB).clamp(0.0, (n - 2).toDouble());
-
-      final int idxA = posA.floor();
-      final double fracA = posA - idxA;
-      final int idxB = posB.floor();
-      final double fracB = posB - idxB;
-
-      final double sampleLA =
-          srcL[idxA] * (1.0 - fracA) + srcL[idxA + 1] * fracA;
-      final double sampleLB =
-          srcL[idxB] * (1.0 - fracB) + srcL[idxB + 1] * fracB;
-
-      final double sampleRA =
-          srcR[idxA] * (1.0 - fracA) + srcR[idxA + 1] * fracA;
-      final double sampleRB =
-          srcR[idxB] * (1.0 - fracB) + srcR[idxB + 1] * fracB;
-
-      left[i] = antiAliasLpL.process(sampleLA * winA + sampleLB * winB);
-      right[i] = antiAliasLpR.process(sampleRA * winA + sampleRB * winB);
+      left[i] = vL.clamp(-0.98, 0.98);
+      right[i] = vR.clamp(-0.98, 0.98);
     }
+  }
+
+  double _cubicInterp(double y0, double y1, double y2, double y3, double t) {
+    final double a0 = -0.5 * y0 + 1.5 * y1 - 1.5 * y2 + 0.5 * y3;
+    final double a1 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
+    final double a2 = -0.5 * y0 + 0.5 * y2;
+    final double a3 = y1;
+    return ((a0 * t + a1) * t + a2) * t + a3;
   }
 
   void _applyNoiseGateAndDeEsser(
@@ -395,7 +477,7 @@ class DspEngineService {
     final double gateThreshLinear = _dbToLinear(params.noiseGateThresholdDb);
     final double deEssFreq = params.deEsserFrequencyHz.clamp(4500.0, 8000.0);
     final double deEssStrength =
-        (params.deEsserAmount * intensity).clamp(0.25, 0.92);
+        (params.deEsserAmount * intensity).clamp(0.20, 0.85);
 
     // Bộ lọc dò âm xì (Sibilance Detector Bandpass) ở tần số deEssFreq
     final sibDetectorL = _BiquadFilter.bandPass(sr, deEssFreq, 1.4);
@@ -424,9 +506,9 @@ class DspEngineService {
       final double sibR = sibDetectorR.process(right[i]);
       final double sibEnv = 0.5 * (sibL.abs() + sibR.abs());
 
-      double deEssCut = 0.20 * deEssStrength;
-      if (sibEnv > 0.018) {
-        deEssCut = deEssStrength * ((sibEnv - 0.012) / (sibEnv + 0.025));
+      double deEssCut = 0.12 * deEssStrength;
+      if (sibEnv > 0.020) {
+        deEssCut = deEssStrength * ((sibEnv - 0.015) / (sibEnv + 0.025));
       }
 
       left[i] = (left[i] - sibL * deEssCut) * gateGain;
@@ -434,6 +516,9 @@ class DspEngineService {
     }
   }
 
+  /// Chỉnh cao độ (Auto-Tune) đồng bộ pha WSOLA không trộn chồng Dry/Wet:
+  /// - Chỉ can thiệp khi cao độ thực tế bị lệch khỏi tâm nốt nhạc > 24 cents (bảo toàn luyến láy & rung tự nhiên).
+  /// - Thay thế trực tiếp bằng khung sóng đồng bộ pha (Phase-Matched Overlap-Add) nên tuyệt đối không bị tiếng "rung pha / chorus".
   int _applyPitchCorrection(
     Float64List left,
     Float64List right,
@@ -441,73 +526,112 @@ class DspEngineService {
     double strength,
     double retuneSpeed,
   ) {
-    const int frameSize = 1024;
+    const int winLen = 1024;
     const int hopSize = 512;
-    if (left.length < frameSize * 2) return 0;
+    const int searchRadius = 160;
+    final int n = left.length;
+    if (n < winLen * 2) return 0;
 
-    final Float64List outL = Float64List.fromList(left);
-    final Float64List outR = Float64List.fromList(right);
+    final Float64List outL = Float64List(n);
+    final Float64List outR = Float64List(n);
+    final Float64List winNorm = Float64List(n);
+    final Float64List hann = Float64List(winLen);
+    for (int i = 0; i < winLen; i++) {
+      hann[i] = 0.5 * (1.0 - math.cos(2.0 * math.pi * i / winLen));
+    }
+
     int correctedCount = 0;
     double smoothedRatio = 1.0;
 
-    for (int start = 0; start + frameSize <= left.length; start += hopSize) {
-      final frameMono = Float64List(frameSize);
+    for (int start = 0; start + winLen <= n; start += hopSize) {
+      final frameMono = Float64List(winLen);
       double energy = 0.0;
-      for (int i = 0; i < frameSize; i++) {
+      for (int i = 0; i < winLen; i++) {
         final double m = 0.5 * (left[start + i] + right[start + i]);
         frameMono[i] = m;
         energy += m * m;
       }
 
-      if (energy / frameSize < 1e-4) {
-        smoothedRatio = 0.9 * smoothedRatio + 0.1 * 1.0;
-        continue;
+      double targetRatio = 1.0;
+      if (energy / winLen >= 1.5e-4) {
+        final double detectedHz = _analyzer.detectPitchYin(frameMono, sr);
+        if (detectedHz >= 85.0 && detectedHz <= 880.0) {
+          final double midiNote =
+              69.0 + 12.0 * (math.log(detectedHz / 440.0) / math.ln2);
+          final double nearestMidi = midiNote.roundToDouble();
+          final double centError = (midiNote - nearestMidi).abs() * 100.0;
+
+          // Deadband 24 cents: giữ nguyên độ rung & luyến láy tự nhiên nếu hát đúng nốt
+          if (centError > 24.0) {
+            final double targetHz =
+                440.0 * math.pow(2.0, (nearestMidi - 69.0) / 12.0);
+            final double rawRatio = (targetHz / detectedHz).clamp(0.93, 1.07);
+            targetRatio = 1.0 + (rawRatio - 1.0) * strength * 0.75;
+          }
+        }
       }
 
-      final double detectedHz = _analyzer.detectPitchYin(frameMono, sr);
-      if (detectedHz >= 85.0 && detectedHz <= 950.0) {
-        // Tìm nốt nhạc chuẩn gần nhất theo thang 12 bán cung (A4 = 440Hz)
-        final double midiNote =
-            69.0 + 12.0 * (math.log(detectedHz / 440.0) / math.ln2);
-        final double nearestMidi = midiNote.roundToDouble();
-        final double targetHz =
-            440.0 * math.pow(2.0, (nearestMidi - 69.0) / 12.0);
+      smoothedRatio =
+          (1.0 - retuneSpeed * 0.55) * smoothedRatio + (retuneSpeed * 0.55) * targetRatio;
 
-        final double rawRatio = (targetHz / detectedHz).clamp(0.92, 1.08);
-        // Áp dụng tốc độ kéo nốt (Retune Speed) và mức độ Pitch Correction
-        final double targetRatio = 1.0 + (rawRatio - 1.0) * strength;
-        smoothedRatio =
-            (1.0 - retuneSpeed) * smoothedRatio + retuneSpeed * targetRatio;
-
-        if ((smoothedRatio - 1.0).abs() > 0.003) {
-          correctedCount++;
-          // Nội suy dịch cao độ mượt với cửa sổ Hann (Overlap-Add Pitch Shifting)
-          for (int i = 0; i < frameSize; i++) {
-            final double win =
-                0.5 * (1.0 - math.cos(2.0 * math.pi * i / (frameSize - 1)));
-            final double srcPos = start + i * smoothedRatio;
-            final int idx0 = srcPos.floor().clamp(0, left.length - 2);
-            final double frac = srcPos - idx0;
-
-            final double resampledL =
-                left[idx0] * (1.0 - frac) + left[idx0 + 1] * frac;
-            final double resampledR =
-                right[idx0] * (1.0 - frac) + right[idx0 + 1] * frac;
-
-            // Hòa trộn mượt vào vùng cửa sổ để giữ độ tự nhiên của âm sắc (Formant preservation)
-            final double blend = win * 0.65 * strength;
-            outL[start + i] =
-                outL[start + i] * (1.0 - blend) + resampledL * blend;
-            outR[start + i] =
-                outR[start + i] * (1.0 - blend) + resampledR * blend;
+      if ((smoothedRatio - 1.0).abs() <= 0.008) {
+        // Không cần dịch cao độ -> giữ nguyên 100% tín hiệu gốc sạch sẽ
+        for (int i = 0; i < winLen; i++) {
+          final double w = hann[i];
+          outL[start + i] += left[start + i] * w;
+          outR[start + i] += right[start + i] * w;
+          winNorm[start + i] += w;
+        }
+      } else {
+        correctedCount++;
+        // Khớp pha cạnh trái của khung với đoạn cuối đã ghi vào outL/outR (Phase-Aligned WSOLA)
+        int alignedStart = start;
+        if (start >= hopSize) {
+          final int minCand = math.max(0, start - searchRadius);
+          final int maxCand = math.min(n - winLen, start + searchRadius);
+          double bestScore = -1e18;
+          for (int cand = minCand; cand <= maxCand; cand += 3) {
+            double dot = 0.0;
+            double candE = 1e-9;
+            for (int k = 0; k < 160; k += 2) {
+              final double oVal =
+                  winNorm[start + k] > 1e-4 ? outL[start + k] / winNorm[start + k] : left[start + k];
+              final double cVal = left[cand + k];
+              dot += oVal * cVal;
+              candE += cVal * cVal;
+            }
+            final double score = dot / math.sqrt(candE);
+            if (score > bestScore) {
+              bestScore = score;
+              alignedStart = cand;
+            }
           }
+        }
+
+        for (int i = 0; i < winLen; i++) {
+          final double w = hann[i];
+          final double srcPos = (alignedStart + i * smoothedRatio).clamp(1.0, (n - 3).toDouble());
+          final int idx = srcPos.floor();
+          final double t = srcPos - idx;
+
+          final double sL =
+              _cubicInterp(left[idx - 1], left[idx], left[idx + 1], left[idx + 2], t);
+          final double sR =
+              _cubicInterp(right[idx - 1], right[idx], right[idx + 1], right[idx + 2], t);
+
+          outL[start + i] += sL * w;
+          outR[start + i] += sR * w;
+          winNorm[start + i] += w;
         }
       }
     }
 
-    for (int i = 0; i < left.length; i++) {
-      left[i] = outL[i];
-      right[i] = outR[i];
+    for (int i = 0; i < n; i++) {
+      final double wn = winNorm[i];
+      if (wn > 1e-5) {
+        left[i] = (outL[i] / wn).clamp(-0.98, 0.98);
+        right[i] = (outR[i] / wn).clamp(-0.98, 0.98);
+      }
     }
     return correctedCount;
   }
@@ -520,8 +644,8 @@ class DspEngineService {
     double intensity,
   ) {
     final double eqScale = (intensity * 1.15).clamp(0.0, 1.6);
-    // Giới hạn mức tăng dải cao 10kHz (Air) tối đa +1.2dB và cắt nhẹ trên 7.2kHz để không làm nổi tiếng xì của mic điện thoại
-    final double safeAirDb = (params.eqAir10kHzDb * eqScale).clamp(-4.0, 1.2);
+    // Giới hạn mức tăng dải cao 10kHz (Air) tối đa +1.5dB và cắt mượt trên 9.5kHz để giữ giọng trong trẻo, không bị xì
+    final double safeAirDb = (params.eqAir10kHzDb * eqScale).clamp(-4.0, 1.5);
     final List<_BiquadFilter> filtersL = [
       _BiquadFilter.lowShelf(sr, 115.0, params.eqSub100HzDb * eqScale),
       _BiquadFilter.peaking(sr, 280.0, 0.9, params.eqLowMid280HzDb * eqScale),
@@ -533,7 +657,7 @@ class DspEngineService {
         (params.eqHighMid3500HzDb * eqScale).clamp(-4.0, 2.5),
       ),
       _BiquadFilter.highShelf(sr, 7500.0, safeAirDb),
-      _BiquadFilter.lowPass(sr, 7400.0, 0.707),
+      _BiquadFilter.lowPass(sr, 9500.0, 0.707),
     ];
 
     final List<_BiquadFilter> filtersR = [
@@ -547,7 +671,7 @@ class DspEngineService {
         (params.eqHighMid3500HzDb * eqScale).clamp(-4.0, 2.5),
       ),
       _BiquadFilter.highShelf(sr, 7500.0, safeAirDb),
-      _BiquadFilter.lowPass(sr, 7400.0, 0.707),
+      _BiquadFilter.lowPass(sr, 9500.0, 0.707),
     ];
 
     for (int i = 0; i < left.length; i++) {
