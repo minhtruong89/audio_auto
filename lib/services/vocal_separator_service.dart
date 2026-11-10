@@ -2,26 +2,64 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'audio_io_service.dart';
+import 'onnx_uvr_separator_service.dart';
 import 'voice_analyzer_service.dart';
 
 /// Kết quả tách 2 luồng âm thanh (Stem Separation) từ bản thu Karaoke
 class SeparatedStems {
   final PcmAudioData vocalStem; // Luồng giọng hát chính đã tách để đưa vào DSP
   final PcmAudioData instrumentalStem; // Luồng nhạc nền từ loa ngoài để trộn lại
+  final bool usedAiOnnxModel; // Đánh dấu đã dùng mạng nơ-ron UVR-MDX-NET ONNX hay chưa
 
   const SeparatedStems({
     required this.vocalStem,
     required this.instrumentalStem,
+    this.usedAiOnnxModel = false,
   });
 }
 
-/// Bộ tách Giọng hát (Vocal) và Nhạc nền (Instrumental) chạy On-Device (Phương án 3 - Hướng A nâng cấp):
-/// Kết hợp 3 tầng:
-/// 1. STFT 1024-Point Spectral Unmixing (Phân tích phổ Fourier ngắn hạn)
-/// 2. Adaptive Stationary Music Floor Subtraction (Trừ nền nhạc cụ ổn định theo từng tần số)
-/// 3. YIN F0 Harmonic Comb Masking (Mặt nạ răng lược chỉ giữ lại đúng các bậc hài âm k*F0 của dây thanh quản người hát)
+/// Bộ tách Giọng hát (Vocal) và Nhạc nền (Instrumental) chạy On-Device:
+/// - **Ưu tiên Cách B1 (Deep Learning AI ONNX)**: Chạy mô hình mạng nơ-ron mã nguồn mở
+///   `UVR_MDXNET_9482.onnx` (Ultimate Vocal Remover MDX-Net) trực tiếp trên thiết bị qua C++ ONNX Runtime (`sherpa_onnx`).
+///   Có bộ nhớ đệm (Cache) theo bản thu để khi người dùng đổi Preset / đổi Hồ sơ giọng thì không phải chờ tách lại.
+/// - **Fallback an toàn (Hướng A - STFT Harmonic Comb)**: Dùng trong môi trường unit test không nạp model hoặc khi máy thiếu RAM.
 class VocalSeparatorService {
   final VoiceAnalyzerService _pitchDetector = VoiceAnalyzerService();
+  final OnnxUvrSeparatorService _onnxUvr = OnnxUvrSeparatorService();
+
+  // Bộ nhớ đệm kết quả tách gần nhất để đổi Giọng lưu / Preset tức thì trong 50ms
+  int? _cachedAudioLength;
+  double? _cachedAudioSignature;
+  SeparatedStems? _cachedStems;
+
+  bool get isAiOnnxReady => _onnxUvr.isInitialized;
+
+  void dispose() {
+    _onnxUvr.dispose();
+  }
+
+  /// Khởi tạo mô hình AI `UVR_MDXNET_9482.onnx` từ đường dẫn file nội bộ trên thiết bị
+  bool initAiOnnxModel(String modelFilePath, {int numThreads = 4}) {
+    final ok = _onnxUvr.initModel(modelFilePath, numThreads: numThreads);
+    if (ok) {
+      // Xóa cache cũ nếu trước đó từng chạy bằng DSP fallback
+      if (_cachedStems != null && !_cachedStems!.usedAiOnnxModel) {
+        _cachedStems = null;
+      }
+    }
+    return ok;
+  }
+
+  double _computeQuickSignature(PcmAudioData audio) {
+    final int n = audio.length;
+    if (n == 0) return 0.0;
+    final int step = math.max(1, n ~/ 128);
+    double acc = 0.0;
+    for (int i = 0; i < n; i += step) {
+      acc += audio.leftChannel[i] * (i + 1) - audio.rightChannel[i] * 0.5;
+    }
+    return acc;
+  }
 
   /// Tách bản thu hỗn hợp (Mic thu lẫn giọng + loa ngoài, kể cả Mono lẫn Stereo) thành 2 luồng Vocal và Instrumental
   SeparatedStems separateVocalAndMusic(PcmAudioData mixedAudio) {
@@ -40,6 +78,33 @@ class VocalSeparatorService {
           rightChannel: Float64List(n),
         ),
       );
+    }
+
+    // 1. Kiểm tra bộ nhớ đệm (nếu cùng 1 file âm thanh đầu vào thì trả về ngay lập tức)
+    final double sig = _computeQuickSignature(mixedAudio);
+    if (_cachedStems != null &&
+        _cachedAudioLength == n &&
+        _cachedAudioSignature == sig &&
+        (_cachedStems!.usedAiOnnxModel || !_onnxUvr.isInitialized)) {
+      return _cachedStems!;
+    }
+
+    // 2. Nếu mô hình AI UVR-MDX-NET ONNX đã sẵn sàng -> Chạy tách bằng mạng nơ-ron học sâu (Cách B1)
+    if (_onnxUvr.isInitialized) {
+      try {
+        final aiStems = _onnxUvr.separate(mixedAudio);
+        final result = SeparatedStems(
+          vocalStem: aiStems.vocalStem,
+          instrumentalStem: aiStems.instrumentalStem,
+          usedAiOnnxModel: true,
+        );
+        _cachedAudioLength = n;
+        _cachedAudioSignature = sig;
+        _cachedStems = result;
+        return result;
+      } catch (_) {
+        // Nếu có lỗi bộ nhớ trên thiết bị yếu thì tự động lùi về STFT bên dưới
+      }
     }
 
     const int fftSize = 1024;

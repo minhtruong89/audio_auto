@@ -18,6 +18,7 @@ class WaveformAbPlayer extends StatelessWidget {
     final String modeBadgeText;
     final IconData modeIcon;
 
+    final bool usedAiOnnx = controller.lastReport?.usedAiOnnxModel ?? false;
     switch (mode) {
       case AudioListenMode.original:
         peaks = controller.originalWaveform;
@@ -28,19 +29,25 @@ class WaveformAbPlayer extends StatelessWidget {
       case AudioListenMode.enhancedMix:
         peaks = controller.enhancedWaveform;
         activeColor = AppTheme.accentCyan;
-        modeBadgeText = 'Đã tách STFT • Khớp Giọng + Nhạc';
+        modeBadgeText = usedAiOnnx
+            ? 'AI UVR-ONNX • Khớp Giọng + Nhạc'
+            : 'Đã tách STFT • Khớp Giọng + Nhạc';
         modeIcon = Icons.auto_awesome;
         break;
       case AudioListenMode.vocalSolo:
         peaks = controller.vocalSoloWaveform;
         activeColor = AppTheme.accentEmerald;
-        modeBadgeText = 'SOLO GIỌNG: Chỉ nghe Vocal đã tách & chỉnh';
+        modeBadgeText = usedAiOnnx
+            ? 'SOLO GIỌNG (AI UVR): Chỉ Vocal đã chỉnh'
+            : 'SOLO GIỌNG: Chỉ nghe Vocal đã tách';
         modeIcon = Icons.record_voice_over;
         break;
       case AudioListenMode.musicSolo:
         peaks = controller.musicSoloWaveform;
         activeColor = AppTheme.primaryNeon;
-        modeBadgeText = 'SOLO NHẠC: Chỉ nghe Nhạc nền đã tách';
+        modeBadgeText = usedAiOnnx
+            ? 'SOLO NHẠC (AI UVR): Beat sạch không lời'
+            : 'SOLO NHẠC: Chỉ nghe Nhạc nền đã tách';
         modeIcon = Icons.music_note;
         break;
     }

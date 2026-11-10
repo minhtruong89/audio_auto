@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:audioplayers/audioplayers.dart';
 import 'package:file_picker/file_picker.dart';
@@ -15,6 +16,7 @@ import '../models/studio_mode.dart';
 import '../models/voice_profile.dart';
 import '../services/audio_io_service.dart';
 import '../services/dsp_engine_service.dart';
+import '../services/vocal_separator_service.dart';
 import '../services/voice_analyzer_service.dart';
 
 /// 4 chế độ nghe đối chiếu và kiểm tra chất lượng tách giọng (Stem Solo):
@@ -33,7 +35,6 @@ enum AudioListenMode {
 class AppController extends ChangeNotifier {
   final AudioIoService _audioIo = AudioIoService();
   final VoiceAnalyzerService _analyzer = VoiceAnalyzerService();
-  final DspEngineService _dspEngine = DspEngineService();
   final AudioRecorder _recorder = AudioRecorder();
   final AudioPlayer _player = AudioPlayer();
 
@@ -59,8 +60,12 @@ class AppController extends ChangeNotifier {
   String? _enhancedFilePath;
   String? _vocalSoloFilePath;
   String? _musicSoloFilePath;
+  String? _onnxModelFilePath;
   PcmAudioData? _originalPcm;
   PcmAudioData? _enhancedPcm;
+  SeparatedStems? _cachedStems;
+  int? _cachedStemsInputLength;
+  double? _cachedStemsSignature;
   DspProcessingReport? _lastReport;
 
   List<double> _originalWaveform = List<double>.filled(64, 0.2);
@@ -168,8 +173,52 @@ class AppController extends ChangeNotifier {
       }
     } catch (_) {}
 
-    // Khởi tạo sẵn 1 bản thu Karaoke mẫu (lẫn giọng + nhạc loa ngoài) và xử lý sẵn để test ngay
-    await loadBuiltInDemoKaraoke();
+    // Khởi tạo sẵn 1 bản thu Karaoke mẫu ở dạng nhẹ (Chưa chạy ONNX nặng ngay lúc mở app để tránh nghẽn máy)
+    // Khi người dùng bấm sang Tab 2 (Làm Đẹp Karaoke), hệ thống mới giải nén model và chạy trong Background Isolate
+    await loadBuiltInDemoKaraoke(processImmediately: false);
+  }
+
+  /// Được gọi khi người dùng chuyển sang Tab 2 (Làm Đẹp Karaoke) để xử lý nếu bản mẫu chưa được chạy DSP
+  Future<void> ensureStudioTrackProcessed() async {
+    if (_originalPcm != null && _enhancedPcm == null && !_isBusyProcessing) {
+      await applyDspToCurrentTrack();
+    }
+  }
+
+  /// Giải nén file model `assets/models/UVR_MDXNET_9482.onnx` ra bộ nhớ thiết bị để chạy trên Background Isolate
+  Future<void> _ensureAiOnnxModelLoaded() async {
+    if (_onnxModelFilePath != null && await File(_onnxModelFilePath!).exists()) {
+      return;
+    }
+    try {
+      final dir = await getApplicationSupportDirectory();
+      final modelFile = File('${dir.path}/UVR_MDXNET_9482.onnx');
+      if (!await modelFile.exists() || await modelFile.length() < 1000000) {
+        _statusMessage =
+            'Đang khởi tạo mô hình AI tách giọng UVR-MDX-NET ONNX lần đầu...';
+        notifyListeners();
+        final byteData = await rootBundle.load(
+          'assets/models/UVR_MDXNET_9482.onnx',
+        );
+        final bytes = byteData.buffer.asUint8List(
+          byteData.offsetInBytes,
+          byteData.lengthInBytes,
+        );
+        await modelFile.writeAsBytes(bytes, flush: true);
+      }
+      _onnxModelFilePath = modelFile.path;
+    } catch (_) {}
+  }
+
+  double _computeAudioSignature(PcmAudioData audio) {
+    final int n = audio.length;
+    if (n == 0) return 0.0;
+    final int step = (n ~/ 128) > 1 ? (n ~/ 128) : 1;
+    double acc = 0.0;
+    for (int i = 0; i < n; i += step) {
+      acc += audio.leftChannel[i] * (i + 1) - audio.rightChannel[i] * 0.5;
+    }
+    return acc;
   }
 
   // ===========================================================================
@@ -412,6 +461,7 @@ class AppController extends ChangeNotifier {
   /// Tải một bản thu Karaoke mẫu cụ thể từ `assets/audio/` (mặc định là `diem_xua.wav`)
   Future<void> loadBuiltInDemoKaraoke({
     String assetPath = 'assets/audio/diem_xua.wav',
+    bool processImmediately = true,
   }) async {
     final fileName = assetPath.split('/').last;
     _isBusyProcessing = true;
@@ -436,6 +486,7 @@ class AppController extends ChangeNotifier {
       }
 
       _originalPcm = pcm;
+      _enhancedPcm = null;
       _originalWaveform = pcm.extractWaveformPeaks(64);
       _totalDuration = Duration(
         milliseconds: (pcm.durationSeconds * 1000).round(),
@@ -457,7 +508,12 @@ class AppController extends ChangeNotifier {
         _originalFilePath = origFile.path;
       } catch (_) {}
 
-      await applyDspToCurrentTrack();
+      if (processImmediately) {
+        await applyDspToCurrentTrack();
+      } else {
+        _statusMessage =
+            'Đã nạp "$fileName". Sang Tab 2 để AI tách giọng & áp hồ sơ giọng!';
+      }
     } finally {
       _isBusyProcessing = false;
       notifyListeners();
@@ -622,64 +678,144 @@ class AppController extends ChangeNotifier {
     await applyDspToCurrentTrack();
   }
 
-  /// Thực thi Pipeline Tách Nhạc & Chuỗi 5 Hiệu ứng DSP lên bản thu hiện tại
+  /// Thực thi Pipeline Tách Nhạc & Chuỗi 5 Hiệu ứng DSP trên Background Isolate
+  /// để Giao diện (UI Thread) luôn mượt 60fps, tuyệt đối không bao giờ bị đơ (ANR / Not Responding)!
   Future<void> applyDspToCurrentTrack() async {
     final input = _originalPcm;
     if (input == null) return;
 
+    await _ensureAiOnnxModelLoaded();
+
+    final double sig = _computeAudioSignature(input);
+    final bool hasCachedStems = _cachedStems != null &&
+        _cachedStemsInputLength == input.length &&
+        _cachedStemsSignature == sig;
+
     _isBusyProcessing = true;
-    _statusMessage =
-        'Đang tách Vocal khỏi nhạc loa ngoài & chạy chuỗi 5 hiệu ứng DSP...';
+    _statusMessage = hasCachedStems
+        ? 'Đang áp đặc trưng giọng "${_voiceProfile.name}" & chạy DSP (từ Cache)...'
+        : 'Đang chạy AI UVR-MDX-NET tách riêng Giọng & Nhạc nền (ngầm trên Isolate)...';
     notifyListeners();
 
-    await Future<void>.delayed(const Duration(milliseconds: 40));
+    final paramsSnapshot = _dspParams;
+    final modelPathSnapshot = _onnxModelFilePath;
+    final cachedStemsSnapshot = hasCachedStems ? _cachedStems : null;
+    final tempDir = await getTemporaryDirectory();
+    final tempDirPath = tempDir.path;
+    final ts = DateTime.now().millisecondsSinceEpoch;
 
-    final report = _dspEngine.processKaraokeTrack(input, _dspParams);
-    _enhancedPcm = report.outputAudio;
-    _lastReport = report;
-    _enhancedWaveform = _enhancedPcm!.extractWaveformPeaks(64);
-    _vocalSoloWaveform = report.vocalOnlyAudio.extractWaveformPeaks(64);
-    _musicSoloWaveform = report.musicOnlyAudio.extractWaveformPeaks(64);
-
-    try {
-      final dir = await getTemporaryDirectory();
-      // Xóa các file cũ nếu có và dùng tên file kèm timestamp để tránh AudioPlayer trên Android đọc cache cũ
-      for (final oldPath in [
-        _enhancedFilePath,
-        _vocalSoloFilePath,
-        _musicSoloFilePath,
-      ]) {
-        if (oldPath != null) {
+    // Xóa các file cũ nếu có
+    for (final oldPath in [
+      _enhancedFilePath,
+      _vocalSoloFilePath,
+      _musicSoloFilePath,
+    ]) {
+      if (oldPath != null) {
+        try {
           final oldFile = File(oldPath);
           if (await oldFile.exists()) {
             await oldFile.delete();
           }
-        }
+        } catch (_) {}
       }
-      final ts = DateTime.now().millisecondsSinceEpoch;
-      final outFile = await _audioIo.writeWavFile(
-        _enhancedPcm!,
-        '${dir.path}/karaoke_enhanced_$ts.wav',
+    }
+
+    // Đẩy toàn bộ tác vụ nặng (ONNX C++ FFI + Pitch Shift + 5-Stage DSP + Ghi 3 file WAV) sang Background Isolate
+    final isoResult = await Isolate.run(() async {
+      final engine = DspEngineService();
+      final io = AudioIoService();
+      SeparatedStems stems;
+      if (cachedStemsSnapshot != null && paramsSnapshot.enableStemSeparation) {
+        stems = cachedStemsSnapshot;
+      } else if (paramsSnapshot.enableStemSeparation) {
+        final sep = VocalSeparatorService();
+        try {
+          if (modelPathSnapshot != null && modelPathSnapshot.isNotEmpty) {
+            sep.initAiOnnxModel(modelPathSnapshot, numThreads: 2);
+          }
+          stems = sep.separateVocalAndMusic(input);
+        } finally {
+          sep.dispose();
+        }
+      } else {
+        stems = SeparatedStems(
+          vocalStem: input,
+          instrumentalStem: PcmAudioData(
+            sampleRate: input.sampleRate,
+            channels: 2,
+            leftChannel: Float64List(input.length),
+            rightChannel: Float64List(input.length),
+          ),
+        );
+      }
+
+      final report = engine.processSeparatedStems(
+        vocalStem: stems.vocalStem,
+        musicStem: stems.instrumentalStem,
+        params: paramsSnapshot,
+        usedAiOnnxModel: stems.usedAiOnnxModel,
       );
-      final vocalFile = await _audioIo.writeWavFile(
-        report.vocalOnlyAudio,
-        '${dir.path}/karaoke_vocal_solo_$ts.wav',
+
+      final enhWave = report.outputAudio.extractWaveformPeaks(64);
+      final vocWave = report.vocalOnlyAudio.extractWaveformPeaks(64);
+      final musWave = report.musicOnlyAudio.extractWaveformPeaks(64);
+
+      String? enhPath;
+      String? vocPath;
+      String? musPath;
+      try {
+        final outFile = await io.writeWavFile(
+          report.outputAudio,
+          '$tempDirPath/karaoke_enhanced_$ts.wav',
+        );
+        final vocalFile = await io.writeWavFile(
+          report.vocalOnlyAudio,
+          '$tempDirPath/karaoke_vocal_solo_$ts.wav',
+        );
+        final musicFile = await io.writeWavFile(
+          report.musicOnlyAudio,
+          '$tempDirPath/karaoke_music_solo_$ts.wav',
+        );
+        enhPath = outFile.path;
+        vocPath = vocalFile.path;
+        musPath = musicFile.path;
+      } catch (_) {}
+
+      return (
+        stems: stems,
+        report: report,
+        enhWave: enhWave,
+        vocWave: vocWave,
+        musWave: musWave,
+        enhPath: enhPath,
+        vocPath: vocPath,
+        musPath: musPath,
       );
-      final musicFile = await _audioIo.writeWavFile(
-        report.musicOnlyAudio,
-        '${dir.path}/karaoke_music_solo_$ts.wav',
-      );
-      _enhancedFilePath = outFile.path;
-      _vocalSoloFilePath = vocalFile.path;
-      _musicSoloFilePath = musicFile.path;
-    } catch (_) {}
+    });
+
+    if (paramsSnapshot.enableStemSeparation) {
+      _cachedStems = isoResult.stems;
+      _cachedStemsInputLength = input.length;
+      _cachedStemsSignature = sig;
+    }
+
+    final report = isoResult.report;
+    _enhancedPcm = report.outputAudio;
+    _lastReport = report;
+    _enhancedWaveform = isoResult.enhWave;
+    _vocalSoloWaveform = isoResult.vocWave;
+    _musicSoloWaveform = isoResult.musWave;
+    _enhancedFilePath = isoResult.enhPath;
+    _vocalSoloFilePath = isoResult.vocPath;
+    _musicSoloFilePath = isoResult.musPath;
 
     _isBusyProcessing = false;
+    final aiTag = report.usedAiOnnxModel ? '[AI UVR-ONNX]' : '[DSP STFT]';
     final shiftTxt = report.appliedSemitoneShift.abs() >= 0.35
-        ? 'Dịch quãng giọng ${report.appliedSemitoneShift >= 0 ? "+" : ""}${report.appliedSemitoneShift.toStringAsFixed(1)} bán cung (từ ${report.trackOriginalF0Hz.round()}Hz -> F0 giọng lưu ${_voiceProfile.speakingF0MeanHz.round()}Hz)'
-        : 'Khớp màu giọng "${_voiceProfile.name}" (F0 ${_voiceProfile.speakingF0MeanHz.round()}Hz)';
+        ? '$aiTag Dịch ${report.appliedSemitoneShift >= 0 ? "+" : ""}${report.appliedSemitoneShift.toStringAsFixed(1)} bán cung (${report.trackOriginalF0Hz.round()}Hz -> F0 giọng lưu ${_voiceProfile.speakingF0MeanHz.round()}Hz)'
+        : '$aiTag Khớp màu giọng "${_voiceProfile.name}" (F0 ${_voiceProfile.speakingF0MeanHz.round()}Hz)';
     _statusMessage =
-        '$shiftTxt • Xử lý ${report.processingTimeMs}ms • Chỉnh ${report.pitchCorrectedFrames} khung Pitch';
+        '$shiftTxt • ${report.processingTimeMs}ms • ${report.pitchCorrectedFrames} khung Pitch';
     notifyListeners();
 
     // Nếu đang phát nhạc thì cập nhật nguồn phát sang bản mới tương ứng chế độ đang nghe

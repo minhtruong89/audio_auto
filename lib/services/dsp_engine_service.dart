@@ -17,6 +17,7 @@ class DspProcessingReport {
   final int processingTimeMs;
   final double trackOriginalF0Hz;
   final double appliedSemitoneShift;
+  final bool usedAiOnnxModel;
 
   const DspProcessingReport({
     required this.outputAudio,
@@ -28,6 +29,7 @@ class DspProcessingReport {
     required this.processingTimeMs,
     this.trackOriginalF0Hz = 180.0,
     this.appliedSemitoneShift = 0.0,
+    this.usedAiOnnxModel = false,
   });
 }
 
@@ -35,6 +37,12 @@ class DspProcessingReport {
 class DspEngineService {
   final VocalSeparatorService _separator = VocalSeparatorService();
   final VoiceAnalyzerService _analyzer = VoiceAnalyzerService();
+
+  bool get isAiOnnxReady => _separator.isAiOnnxReady;
+
+  bool initAiOnnxModel(String modelFilePath, {int numThreads = 4}) {
+    return _separator.initAiOnnxModel(modelFilePath, numThreads: numThreads);
+  }
 
   /// Xử lý toàn bộ bản thu Karaoke theo thông số [params]
   DspProcessingReport processKaraokeTrack(
@@ -44,15 +52,16 @@ class DspEngineService {
     final sw = Stopwatch()..start();
     final int sr = inputAudio.sampleRate;
     final int n = inputAudio.length;
-    final double intensity = params.masterIntensity.clamp(0.0, 1.5);
 
     // Bước 0: Tách luồng Vocal và luồng Nhạc nền (Stem Separation)
     late final PcmAudioData vocalStem;
     late final PcmAudioData musicStem;
+    bool usedAiOnnx = false;
     if (params.enableStemSeparation) {
       final stems = _separator.separateVocalAndMusic(inputAudio);
       vocalStem = stems.vocalStem;
       musicStem = stems.instrumentalStem;
+      usedAiOnnx = stems.usedAiOnnxModel;
     } else {
       vocalStem = inputAudio;
       musicStem = PcmAudioData(
@@ -62,6 +71,30 @@ class DspEngineService {
         rightChannel: Float64List(n),
       );
     }
+
+    return processSeparatedStems(
+      vocalStem: vocalStem,
+      musicStem: musicStem,
+      params: params,
+      usedAiOnnxModel: usedAiOnnx,
+      externalStopwatch: sw,
+    );
+  }
+
+  /// Xử lý chuỗi 5 hiệu ứng DSP & Chuyển giọng trực tiếp trên 2 luồng Vocal + Music đã tách sẵn
+  /// (Có thể chạy trong Background Isolate hoặc dùng lại Stems đã cache mà không cần tách lại)
+  DspProcessingReport processSeparatedStems({
+    required PcmAudioData vocalStem,
+    required PcmAudioData musicStem,
+    required DspParameters params,
+    bool usedAiOnnxModel = false,
+    Stopwatch? externalStopwatch,
+  }) {
+    final sw = externalStopwatch ?? (Stopwatch()..start());
+    final int sr = vocalStem.sampleRate;
+    final int n = vocalStem.length;
+    final double intensity = params.masterIntensity.clamp(0.0, 1.5);
+    final bool usedAiOnnx = usedAiOnnxModel;
 
     Float64List vLeft = Float64List.fromList(vocalStem.leftChannel);
     Float64List vRight = Float64List.fromList(vocalStem.rightChannel);
@@ -191,6 +224,7 @@ class DspEngineService {
       processingTimeMs: sw.elapsedMilliseconds,
       trackOriginalF0Hz: trackF0Hz,
       appliedSemitoneShift: appliedSemitones,
+      usedAiOnnxModel: usedAiOnnx,
     );
   }
 
@@ -263,20 +297,20 @@ class DspEngineService {
     // 3. Áp dấu vân tay Vòm Họng (Vocal Tract Formant Fingerprint) theo F0 và Spectral Centroid của giọng đã lưu
     // Giúp phân biệt rõ ràng ngay cả giữa 2 giọng cùng là Nam (VD: Giọng Nam 1 ấm/dày vs Giọng Nam 2 thanh/sáng)
     final double chestGainDb =
-        ((165.0 - params.targetProfileF0Hz) / 14.0).clamp(-4.5, 5.5) * convStrength;
+        ((165.0 - params.targetProfileF0Hz) / 14.0).clamp(-3.5, 4.5) * convStrength;
     final double throatFormantFreq =
         (params.targetProfileF0Hz * 4.5).clamp(480.0, 1150.0);
     final double throatGainDb =
-        ((params.targetProfileCentroidHz - 1800.0) / 220.0).clamp(-4.0, 4.5) * convStrength;
+        ((params.targetProfileCentroidHz - 1800.0) / 240.0).clamp(-3.0, 3.5) * convStrength;
     final double brightnessDb =
-        ((params.targetProfileCentroidHz - 1750.0) / 180.0).clamp(-4.5, 5.5) * convStrength;
+        ((params.targetProfileCentroidHz - 1850.0) / 260.0).clamp(-3.5, 2.5) * convStrength;
 
     final chestL = _BiquadFilter.peaking(sr, 195.0, 0.9, chestGainDb);
     final chestR = _BiquadFilter.peaking(sr, 195.0, 0.9, chestGainDb);
     final throatL = _BiquadFilter.peaking(sr, throatFormantFreq, 1.4, throatGainDb);
     final throatR = _BiquadFilter.peaking(sr, throatFormantFreq, 1.4, throatGainDb);
-    final brightL = _BiquadFilter.highShelf(sr, 3200.0, brightnessDb);
-    final brightR = _BiquadFilter.highShelf(sr, 3200.0, brightnessDb);
+    final brightL = _BiquadFilter.highShelf(sr, 3000.0, brightnessDb);
+    final brightR = _BiquadFilter.highShelf(sr, 3000.0, brightnessDb);
 
     for (int i = 0; i < left.length; i++) {
       left[i] = brightL.process(throatL.process(chestL.process(left[i])));
@@ -290,6 +324,8 @@ class DspEngineService {
   }
 
   /// Bộ dịch cao độ thời gian thực Dual-Delay-Line Granular Pitch Shifter (bảo toàn thời lượng bài hát)
+  /// Kết hợp bộ lọc thông thấp khử răng cưa (Anti-Aliasing / Anti-Buzz LPF) để giọng sau khi dịch tông
+  /// hoàn toàn mượt, ấm, không bị rè hạt (grainy buzz) hay xì chói.
   void _olaPitchShiftInPlace(
     Float64List left,
     Float64List right,
@@ -300,10 +336,17 @@ class DspEngineService {
     final Float64List srcL = Float64List.fromList(left);
     final Float64List srcR = Float64List.fromList(right);
 
-    const int grainSize = 1536; // ~35ms tại 44.1kHz (chuẩn mượt cho giọng hát)
+    const int grainSize = 2048; // ~46.4ms tại 44.1kHz (mượt hơn, không bị rung rè ở giọng trầm)
     final double rate = 1.0 - pitchRatio;
     double phaseA = 0.0;
     double phaseB = grainSize / 2.0;
+
+    // Bộ lọc khử răng cưa sau khi nội suy hạt (chống tiếng rè kim loại ở dải 6.5kHz+)
+    final double cutoffHz = pitchRatio > 1.0
+        ? (6800.0 / pitchRatio.clamp(1.0, 1.6)).clamp(4200.0, 6800.0)
+        : 6800.0;
+    final antiAliasLpL = _BiquadFilter.lowPass(sr, cutoffHz, 0.707);
+    final antiAliasLpR = _BiquadFilter.lowPass(sr, cutoffHz, 0.707);
 
     for (int i = 0; i < n; i++) {
       phaseA += rate;
@@ -337,8 +380,8 @@ class DspEngineService {
       final double sampleRB =
           srcR[idxB] * (1.0 - fracB) + srcR[idxB + 1] * fracB;
 
-      left[i] = sampleLA * winA + sampleLB * winB;
-      right[i] = sampleRA * winA + sampleRB * winB;
+      left[i] = antiAliasLpL.process(sampleLA * winA + sampleLB * winB);
+      right[i] = antiAliasLpR.process(sampleRA * winA + sampleRB * winB);
     }
   }
 
@@ -350,33 +393,40 @@ class DspEngineService {
     double intensity,
   ) {
     final double gateThreshLinear = _dbToLinear(params.noiseGateThresholdDb);
-    final double deEssFreq = params.deEsserFrequencyHz.clamp(4500.0, 8500.0);
+    final double deEssFreq = params.deEsserFrequencyHz.clamp(4500.0, 8000.0);
     final double deEssStrength =
-        (params.deEsserAmount * intensity).clamp(0.0, 0.9);
+        (params.deEsserAmount * intensity).clamp(0.25, 0.92);
 
     // Bộ lọc dò âm xì (Sibilance Detector Bandpass) ở tần số deEssFreq
-    final sibDetectorL = _BiquadFilter.bandPass(sr, deEssFreq, 2.0);
-    final sibDetectorR = _BiquadFilter.bandPass(sr, deEssFreq, 2.0);
+    final sibDetectorL = _BiquadFilter.bandPass(sr, deEssFreq, 1.4);
+    final sibDetectorR = _BiquadFilter.bandPass(sr, deEssFreq, 1.4);
 
     double gateEnv = 0.0;
-    double gateGain = 1.0;
+    double gateGain = 0.0;
 
     for (int i = 0; i < left.length; i++) {
       final double absSample = 0.5 * (left[i].abs() + right[i].abs());
-      gateEnv = 0.995 * gateEnv + 0.005 * absSample;
+      if (absSample > gateEnv) {
+        gateEnv = 0.985 * gateEnv + 0.015 * absSample;
+      } else {
+        gateEnv = 0.999 * gateEnv + 0.001 * absSample;
+      }
 
-      // Smooth Noise Gate (giảm tạp âm phòng khi ngừng hát nhưng không cắt cụt hơi thở)
-      final double targetGate = gateEnv < gateThreshLinear ? 0.35 : 1.0;
-      gateGain = 0.997 * gateGain + 0.003 * targetGate;
+      // Smooth Expander Noise Gate: khi ngừng hát thì dìm hẳn nhiễu nền xuống 0.05 để không còn tiếng xì xì
+      final double targetGate = gateEnv < gateThreshLinear
+          ? 0.05
+          : ((gateEnv - gateThreshLinear) / (gateThreshLinear * 1.5 + 1e-4))
+              .clamp(0.05, 1.0);
+      gateGain = 0.995 * gateGain + 0.005 * targetGate;
 
       // Dynamic De-esser: Trích xuất thành phần âm xì chói và trừ bớt khi vượt ngưỡng
       final double sibL = sibDetectorL.process(left[i]);
       final double sibR = sibDetectorR.process(right[i]);
       final double sibEnv = 0.5 * (sibL.abs() + sibR.abs());
 
-      double deEssCut = 0.0;
-      if (sibEnv > 0.035) {
-        deEssCut = deEssStrength * ((sibEnv - 0.035) / (sibEnv + 0.05));
+      double deEssCut = 0.20 * deEssStrength;
+      if (sibEnv > 0.018) {
+        deEssCut = deEssStrength * ((sibEnv - 0.012) / (sibEnv + 0.025));
       }
 
       left[i] = (left[i] - sibL * deEssCut) * gateGain;
@@ -469,18 +519,21 @@ class DspEngineService {
     DspParameters params,
     double intensity,
   ) {
-    final double eqScale = (intensity * 1.45).clamp(0.0, 2.2);
+    final double eqScale = (intensity * 1.15).clamp(0.0, 1.6);
+    // Giới hạn mức tăng dải cao 10kHz (Air) tối đa +1.2dB và cắt nhẹ trên 7.2kHz để không làm nổi tiếng xì của mic điện thoại
+    final double safeAirDb = (params.eqAir10kHzDb * eqScale).clamp(-4.0, 1.2);
     final List<_BiquadFilter> filtersL = [
       _BiquadFilter.lowShelf(sr, 115.0, params.eqSub100HzDb * eqScale),
       _BiquadFilter.peaking(sr, 280.0, 0.9, params.eqLowMid280HzDb * eqScale),
       _BiquadFilter.peaking(sr, 1200.0, 1.0, params.eqMid1200HzDb * eqScale),
       _BiquadFilter.peaking(
         sr,
-        3400.0,
-        0.85,
-        params.eqHighMid3500HzDb * eqScale,
+        3200.0,
+        0.9,
+        (params.eqHighMid3500HzDb * eqScale).clamp(-4.0, 2.5),
       ),
-      _BiquadFilter.highShelf(sr, 8500.0, params.eqAir10kHzDb * eqScale),
+      _BiquadFilter.highShelf(sr, 7500.0, safeAirDb),
+      _BiquadFilter.lowPass(sr, 7400.0, 0.707),
     ];
 
     final List<_BiquadFilter> filtersR = [
@@ -489,17 +542,18 @@ class DspEngineService {
       _BiquadFilter.peaking(sr, 1200.0, 1.0, params.eqMid1200HzDb * eqScale),
       _BiquadFilter.peaking(
         sr,
-        3400.0,
-        0.85,
-        params.eqHighMid3500HzDb * eqScale,
+        3200.0,
+        0.9,
+        (params.eqHighMid3500HzDb * eqScale).clamp(-4.0, 2.5),
       ),
-      _BiquadFilter.highShelf(sr, 8500.0, params.eqAir10kHzDb * eqScale),
+      _BiquadFilter.highShelf(sr, 7500.0, safeAirDb),
+      _BiquadFilter.lowPass(sr, 7400.0, 0.707),
     ];
 
     for (int i = 0; i < left.length; i++) {
       double sL = left[i];
       double sR = right[i];
-      for (int b = 0; b < 5; b++) {
+      for (int b = 0; b < filtersL.length; b++) {
         sL = filtersL[b].process(sL);
         sR = filtersR[b].process(sR);
       }
@@ -637,9 +691,8 @@ class DspEngineService {
   double _dbToLinear(double db) => math.pow(10.0, db / 20.0).toDouble();
 
   double _warmHarmonicExciter(double x) {
-    // Hàm saturator bất đối xứng nhẹ tạo hài bậc 2 ấm áp như Preamp đèn
-    if (x.abs() < 0.1) return x;
-    return (x + 0.08 * x * x * (x >= 0 ? 1.0 : -1.0)) / 1.06;
+    // Giữ độ trong trẻo tuyệt đối cho giọng hát (loại bỏ méo hài bậc 2 gây cảm giác rè nhẹ)
+    return x;
   }
 
   double _softClipLimiter(double x) {
@@ -767,6 +820,22 @@ class _BiquadFilter {
       alpha / a0,
       0.0,
       -alpha / a0,
+      (-2.0 * cosW) / a0,
+      (1.0 - alpha) / a0,
+    );
+  }
+
+  factory _BiquadFilter.lowPass(int sampleRate, double freq, double q) {
+    final double w0 = 2.0 * math.pi * freq / sampleRate;
+    final double cosW = math.cos(w0);
+    final double alpha = math.sin(w0) / (2.0 * q);
+    final double a0 = 1.0 + alpha;
+    final double b1 = 1.0 - cosW;
+    final double b0 = b1 / 2.0;
+    return _BiquadFilter(
+      b0 / a0,
+      b1 / a0,
+      b0 / a0,
       (-2.0 * cosW) / a0,
       (1.0 - alpha) / a0,
     );

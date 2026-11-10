@@ -97,6 +97,9 @@ class _HomeScreenState extends State<HomeScreen> {
                 return;
               }
               setState(() => _selectedIndex = idx);
+              if (idx == 1) {
+                widget.controller.ensureStudioTrackProcessed();
+              }
             },
             destinations: [
               const NavigationDestination(
