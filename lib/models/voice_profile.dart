@@ -17,6 +17,7 @@ enum VocalRangeType {
 /// Hồ sơ đặc trưng giọng của người dùng được trích xuất qua 4 bước thu âm
 class UserVoiceProfile {
   final String id;
+  final String name; // Tên hồ sơ giọng do người dùng đặt (VD: "Giọng Nam Phòng Khách")
   final DateTime createdAt;
 
   // Bước 1: Tạp âm nền & Giọng nói tự nhiên
@@ -49,6 +50,7 @@ class UserVoiceProfile {
 
   const UserVoiceProfile({
     required this.id,
+    this.name = 'Giọng Mặc Định',
     required this.createdAt,
     required this.noiseFloorDb,
     required this.speakingF0MeanHz,
@@ -65,10 +67,32 @@ class UserVoiceProfile {
     required this.eqCompensationGainsDb,
   });
 
+  UserVoiceProfile copyWith({String? id, String? name, DateTime? createdAt}) {
+    return UserVoiceProfile(
+      id: id ?? this.id,
+      name: name ?? this.name,
+      createdAt: createdAt ?? this.createdAt,
+      noiseFloorDb: noiseFloorDb,
+      speakingF0MeanHz: speakingF0MeanHz,
+      spectralCentroidHz: spectralCentroidHz,
+      minPitchHz: minPitchHz,
+      maxPitchHz: maxPitchHz,
+      comfortZoneHz: comfortZoneHz,
+      vocalType: vocalType,
+      pitchJitterPercent: pitchJitterPercent,
+      vibratoRateHz: vibratoRateHz,
+      dynamicStabilityDb: dynamicStabilityDb,
+      sibilancePeakHz: sibilancePeakHz,
+      sibilanceRatio: sibilanceRatio,
+      eqCompensationGainsDb: eqCompensationGainsDb,
+    );
+  }
+
   /// Hồ sơ mặc định thông minh khi người dùng muốn test ngay mà chưa đo
   factory UserVoiceProfile.defaultDemo() {
     return UserVoiceProfile(
       id: 'demo_profile',
+      name: 'Chưa lưu giọng (Mẫu tham khảo)',
       createdAt: DateTime(2026, 11, 9),
       noiseFloorDb: -48.0,
       speakingF0MeanHz: 155.0,
@@ -129,6 +153,7 @@ class UserVoiceProfile {
   Map<String, dynamic> toMap() {
     return {
       'id': id,
+      'name': name,
       'createdAt': createdAt.toIso8601String(),
       'noiseFloorDb': noiseFloorDb,
       'speakingF0MeanHz': speakingF0MeanHz,
@@ -149,6 +174,7 @@ class UserVoiceProfile {
   factory UserVoiceProfile.fromMap(Map<String, dynamic> map) {
     return UserVoiceProfile(
       id: map['id'] as String? ?? 'profile',
+      name: map['name'] as String? ?? 'Hồ sơ Giọng đã lưu',
       createdAt: DateTime.tryParse(map['createdAt'] as String? ?? '') ?? DateTime.now(),
       noiseFloorDb: (map['noiseFloorDb'] as num?)?.toDouble() ?? -48.0,
       speakingF0MeanHz: (map['speakingF0MeanHz'] as num?)?.toDouble() ?? 160.0,

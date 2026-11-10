@@ -374,6 +374,30 @@ class StudioModeControlPanel extends StatelessWidget {
           ),
           const Divider(height: 20),
 
+          // 1.5. Chuyển đổi Đặc trưng Giọng & Quãng Giọng (Voice Conversion)
+          _proSectionHeader(
+            title: '1.5. Áp Dấu Vân Tay & Quãng Giọng Đã Lưu (Voice Conversion)',
+            enabled: p.enableVoiceConversion,
+            onToggle: (v) {
+              controller.updateProMixerParams(
+                p.copyWith(enableVoiceConversion: v),
+              );
+              controller.applyDspToCurrentTrack();
+            },
+          ),
+          _sliderRow(
+            label: 'Mức độ ép theo màu giọng & cao độ đã lưu',
+            valueText: '${(p.voiceConversionStrength * 100).round()}%',
+            value: p.voiceConversionStrength,
+            min: 0.0,
+            max: 1.0,
+            onChanged: (v) => controller.updateProMixerParams(
+              p.copyWith(voiceConversionStrength: v),
+            ),
+            onChangeEnd: (_) => controller.applyDspToCurrentTrack(),
+          ),
+          const Divider(height: 20),
+
           // 2. Pitch Correction / Auto-Tune
           _proSectionHeader(
             title: '2. Pitch Correction / Auto-Tune (Chỉnh chênh phô)',
@@ -588,13 +612,18 @@ class StudioModeControlPanel extends StatelessWidget {
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            Text(
-              label,
-              style: const TextStyle(
-                fontSize: 12.5,
-                color: AppTheme.textSecondary,
+            Expanded(
+              child: Text(
+                label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  fontSize: 12.5,
+                  color: AppTheme.textSecondary,
+                ),
               ),
             ),
+            const SizedBox(width: 8),
             Text(
               valueText,
               style: const TextStyle(

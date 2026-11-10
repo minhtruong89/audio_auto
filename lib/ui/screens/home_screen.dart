@@ -44,22 +44,31 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                 ),
                 const SizedBox(width: 10),
-                Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      'VocalAI Karaoke Studio',
-                      style: TextStyle(fontSize: 17, fontWeight: FontWeight.w800),
-                    ),
-                    Text(
-                      'On-Device AI Separation + 5-Stage DSP • ${profile.vocalType.title}',
-                      style: const TextStyle(
-                        fontSize: 11,
-                        color: AppTheme.textSecondary,
-                        fontWeight: FontWeight.w500,
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'VocalAI Karaoke Studio',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 17,
+                          fontWeight: FontWeight.w800,
+                        ),
                       ),
-                    ),
-                  ],
+                      Text(
+                        'On-Device AI + DSP • ${profile.vocalType.title}',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 11,
+                          color: AppTheme.textSecondary,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
               ],
             ),
@@ -67,10 +76,7 @@ class _HomeScreenState extends State<HomeScreen> {
           body: IndexedStack(
             index: _selectedIndex,
             children: [
-              VoiceProfilingWizardScreen(
-                controller: widget.controller,
-                onJumpToStudio: () => setState(() => _selectedIndex = 1),
-              ),
+              VoiceProfilingWizardScreen(controller: widget.controller),
               KaraokeStudioScreen(controller: widget.controller),
             ],
           ),
@@ -78,9 +84,22 @@ class _HomeScreenState extends State<HomeScreen> {
             backgroundColor: AppTheme.cardDark,
             indicatorColor: AppTheme.primaryNeon.withValues(alpha: 0.28),
             selectedIndex: _selectedIndex,
-            onDestinationSelected: (idx) => setState(() => _selectedIndex = idx),
-            destinations: const [
-              NavigationDestination(
+            onDestinationSelected: (idx) {
+              if (idx == 1 && !widget.controller.hasCustomProfile) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text(
+                      'Bạn chưa có hồ sơ giọng nào được lưu! Hãy bấm "Phân tích" và lưu tên giọng trước khi sang Làm Đẹp Karaoke nhé.',
+                    ),
+                    behavior: SnackBarBehavior.floating,
+                  ),
+                );
+                return;
+              }
+              setState(() => _selectedIndex = idx);
+            },
+            destinations: [
+              const NavigationDestination(
                 icon: Icon(Icons.record_voice_over_outlined),
                 selectedIcon: Icon(
                   Icons.record_voice_over_rounded,
@@ -89,12 +108,20 @@ class _HomeScreenState extends State<HomeScreen> {
                 label: '1. Đo Đặc Trưng Giọng (4 Bước)',
               ),
               NavigationDestination(
-                icon: Icon(Icons.tune_outlined),
-                selectedIcon: Icon(
+                enabled: widget.controller.hasCustomProfile,
+                icon: Icon(
+                  Icons.tune_outlined,
+                  color: widget.controller.hasCustomProfile
+                      ? null
+                      : Colors.white.withValues(alpha: 0.28),
+                ),
+                selectedIcon: const Icon(
                   Icons.tune_rounded,
                   color: AppTheme.accentCyan,
                 ),
-                label: '2. Làm Đẹp Karaoke (3 Chế Độ)',
+                label: widget.controller.hasCustomProfile
+                    ? '2. Làm Đẹp Karaoke (3 Chế Độ)'
+                    : '2. Làm Đẹp Karaoke (Chưa lưu giọng)',
               ),
             ],
           ),

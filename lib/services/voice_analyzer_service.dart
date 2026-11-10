@@ -4,7 +4,7 @@ import 'dart:typed_data';
 import '../models/voice_profile.dart';
 import 'audio_io_service.dart';
 
-/// Kết quả phân tích của từng bước đơn lẻ trong Wizard 4 bước
+/// Kết quả phân tích của từng bước đơn lẻ trong Wizard 4 bước, kèm trạng thái kiểm định chất lượng (QC)
 class StepAnalysisMetrics {
   final double noiseFloorDb;
   final double meanPitchHz;
@@ -18,6 +18,14 @@ class StepAnalysisMetrics {
   final double sibilanceRatio;
   final List<double> bandEnergiesDb; // 5 dải tần (100Hz, 280Hz, 1.2kHz, 3.5kHz, 10kHz)
 
+  // Các chỉ số kiểm định bản thu hợp chuẩn (Recording Quality Control)
+  final double durationSeconds;
+  final double voicedDurationSeconds; // Thời lượng thực sự có tiếng người phát âm
+  final double snrDb; // Tỷ lệ Tín hiệu Giọng / Tạp âm nền (Signal-to-Noise Ratio)
+  final bool isClipping; // Có bị vỡ tiếng do để mic quá sát / hét quá to không
+  final bool isQualityValid; // Bản thu có đạt chuẩn để đưa vào hồ sơ giọng không
+  final String qualityFeedback; // Hướng dẫn cụ thể nếu chưa đạt chuẩn
+
   const StepAnalysisMetrics({
     required this.noiseFloorDb,
     required this.meanPitchHz,
@@ -30,13 +38,23 @@ class StepAnalysisMetrics {
     required this.sibilancePeakHz,
     required this.sibilanceRatio,
     required this.bandEnergiesDb,
+    this.durationSeconds = 3.5,
+    this.voicedDurationSeconds = 2.4,
+    this.snrDb = 24.0,
+    this.isClipping = false,
+    this.isQualityValid = true,
+    this.qualityFeedback = 'Đạt chuẩn: Tín hiệu giọng rõ, độ ồn nền tốt.',
   });
 }
 
 /// Bộ phân tích đặc trưng giọng nói On-Device sử dụng thuật toán YIN (Pitch) + Goertzel/FFT (Phổ tần số)
 class VoiceAnalyzerService {
   /// Phân tích một đoạn âm thanh PCM để lấy đầy đủ các chỉ số âm học
-  StepAnalysisMetrics analyzeAudioClip(PcmAudioData audio) {
+  /// [stepIndex]: Bước hiện tại (0..3) để áp dụng tiêu chí kiểm định chất lượng riêng (VD Bước 2 kiểm tra độ mở Đồ->Đố)
+  StepAnalysisMetrics analyzeAudioClip(
+    PcmAudioData audio, {
+    int? stepIndex,
+  }) {
     final Float64List mono = audio.toMono();
     final int sr = audio.sampleRate;
     if (mono.length < 1024) {
@@ -59,6 +77,10 @@ class VoiceAnalyzerService {
     const int hopSize = 512;
     final List<double> frameRmsDb = [];
     final List<double> detectedPitches = [];
+    int clippingSamples = 0;
+    for (int i = 0; i < mono.length; i++) {
+      if (mono[i].abs() >= 0.985) clippingSamples++;
+    }
 
     for (int start = 0; start + frameSize <= mono.length; start += hopSize) {
       double sumSq = 0.0;
@@ -70,8 +92,8 @@ class VoiceAnalyzerService {
       final double db = 20.0 * math.log(math.max(rms, 1e-5)) / math.ln10;
       frameRmsDb.add(db);
 
-      // Chỉ đo cao độ trên các khung có năng lượng giọng hát rõ (trên -40dB)
-      if (db > -40.0) {
+      // Chỉ đo cao độ trên các khung có năng lượng giọng hát rõ (trên -42dB)
+      if (db > -42.0) {
         final double pitch = detectPitchYin(
           Float64List.sublistView(mono, start, start + frameSize),
           sr,
@@ -85,11 +107,15 @@ class VoiceAnalyzerService {
     // 1. Tính ngưỡng tạp âm nền (15% phân vị thấp nhất của RMS dB)
     final sortedRms = List<double>.from(frameRmsDb)..sort();
     final int noiseIdx = (sortedRms.length * 0.15).floor().clamp(0, sortedRms.length - 1);
-    final double noiseFloorDb = sortedRms[noiseIdx].clamp(-65.0, -28.0);
+    final double noiseFloorDb = sortedRms[noiseIdx].clamp(-65.0, -25.0);
 
-    // 2. Độ ổn định âm lượng (Standard deviation của các khung có tiếng hát)
-    final activeRms = sortedRms.where((d) => d > noiseFloorDb + 8.0).toList();
+    // 2. Độ ổn định âm lượng & Tỷ lệ SNR (Signal-to-Noise Ratio)
+    final activeRms = sortedRms.where((d) => d > noiseFloorDb + 6.0).toList();
     double dynamicStabilityDb = 3.0;
+    double voicePeakDb = noiseFloorDb + 18.0;
+    if (activeRms.isNotEmpty) {
+      voicePeakDb = activeRms[(activeRms.length * 0.85).floor().clamp(0, activeRms.length - 1)];
+    }
     if (activeRms.length > 2) {
       final meanDb = activeRms.reduce((a, b) => a + b) / activeRms.length;
       double varSum = 0.0;
@@ -97,6 +123,28 @@ class VoiceAnalyzerService {
         varSum += (d - meanDb) * (d - meanDb);
       }
       dynamicStabilityDb = math.sqrt(varSum / activeRms.length).clamp(1.0, 9.5);
+    }
+
+    final double durationSec = mono.length / sr;
+    final double voicedSec = (detectedPitches.length * hopSize) / sr;
+    final double snrDb = (voicePeakDb - noiseFloorDb).clamp(0.0, 60.0);
+    final bool isClipping = clippingSamples > (mono.length * 0.01);
+
+    // Kiểm định chất lượng bản thu (Recording QC)
+    bool isValid = true;
+    String feedback = 'Đạt chuẩn: Giọng rõ (${voicedSec.toStringAsFixed(1)}s), SNR +${snrDb.toStringAsFixed(0)}dB.';
+    if (durationSec < 1.5) {
+      isValid = false;
+      feedback = 'Bản thu quá ngắn (${durationSec.toStringAsFixed(1)}s). Hãy thu tối thiểu 2 - 4 giây.';
+    } else if (voicedSec < 0.45) {
+      isValid = false;
+      feedback = 'Chưa nhận diện đủ tiếng giọng nói/hát. Hãy phát âm to và rõ hơn vào Mic.';
+    } else if (snrDb < 9.0) {
+      isValid = false;
+      feedback = 'Môi trường hơi ồn hoặc bạn nói quá nhỏ (SNR ${snrDb.toStringAsFixed(1)}dB < 9dB). Hãy đưa mic lại gần hơn.';
+    } else if (isClipping) {
+      isValid = false;
+      feedback = 'Tín hiệu bị vỡ tiếng (Clipping). Hãy để điện thoại cách miệng khoảng 15-20cm.';
     }
 
     // 3. Thống kê Cao độ (F0 Mean, Min, Max, Jitter, Vibrato)
@@ -126,6 +174,21 @@ class VoiceAnalyzerService {
       }
     }
 
+    // Kiểm định riêng cho Bước 2 (Hát nâng tông Đồ -> Đố):
+    // Đảm bảo người dùng thực sự nâng cao độ giọng lên chứ không đọc ngang phè 1 nốt
+    if (isValid && stepIndex == 1) {
+      final double semitoneSpan =
+          12.0 * (math.log(maxPitchHz / math.max(minPitchHz, 60.0)) / math.ln2);
+      if (semitoneSpan < 4.5) {
+        isValid = false;
+        feedback =
+            'Độ mở quãng giọng mới đạt ${semitoneSpan.toStringAsFixed(1)} bán cung (${minPitchHz.round()}–${maxPitchHz.round()}Hz). Bạn đang đọc hơi ngang giọng, hãy hát nâng cao tông dần lên ở các chữ Son ↗ La ↗ Si ↗ Đố nhé!';
+      } else {
+        feedback =
+            'Đạt chuẩn: Quãng giọng mở tốt (+${semitoneSpan.toStringAsFixed(1)} bán cung, từ ${minPitchHz.round()}Hz lên ${maxPitchHz.round()}Hz).';
+      }
+    }
+
     // 4. Phân tích phổ tần số (Spectral Centroid, 5 dải EQ & Sibilance)
     final spectral = _analyzeSpectrumBands(mono, sr);
 
@@ -141,6 +204,12 @@ class VoiceAnalyzerService {
       sibilancePeakHz: spectral.sibilancePeakHz,
       sibilanceRatio: spectral.sibilanceRatio,
       bandEnergiesDb: spectral.bandEnergiesDb,
+      durationSeconds: durationSec,
+      voicedDurationSeconds: voicedSec,
+      snrDb: snrDb,
+      isClipping: isClipping,
+      isQualityValid: isValid,
+      qualityFeedback: feedback,
     );
   }
 
@@ -330,24 +399,37 @@ class VoiceAnalyzerService {
     // Phân loại quãng giọng dựa trên F0 trung bình và quãng giọng
     final VocalRangeType vocalType = _classifyVocalRange(speakingF0, maxPitch);
 
-    // Tính đường cong bù trừ 5-Band EQ tự động từ bước 4 (hoặc trung bình các bước)
-    final List<double> measuredBands =
-        s4?.bandEnergiesDb ?? const [-18.0, -15.0, -14.0, -21.0, -26.0];
+    // Tính đường cong bù trừ 5-Band EQ tự động từ trung bình tất cả các bước đã đo
+    final List<double> measuredBands = List<double>.filled(5, 0.0);
+    int validBandSteps = 0;
+    for (final st in steps) {
+      if (st.bandEnergiesDb.length == 5) {
+        validBandSteps++;
+        for (int b = 0; b < 5; b++) {
+          measuredBands[b] += st.bandEnergiesDb[b];
+        }
+      }
+    }
+    if (validBandSteps > 0) {
+      for (int b = 0; b < 5; b++) {
+        measuredBands[b] /= validBandSteps;
+      }
+    } else {
+      measuredBands.setAll(0, const [-18.0, -15.0, -14.0, -21.0, -26.0]);
+    }
+
     // Đường cong mục tiêu chuẩn giọng hát Karaoke chuyên nghiệp (dB tương đối)
     const List<double> targetRelativeCurve = [-4.0, 1.5, 0.0, 2.5, -2.0];
 
     final double midRef = measuredBands[2];
     final List<double> eqGains = List<double>.filled(5, 0.0);
-    // Band 0 (100Hz): Luôn cắt nhẹ để tránh ù mic và tiếng bass loa karaoke
-    eqGains[0] = -2.8;
+    // Band 0 (100Hz): Cắt ù mic tùy theo giọng trầm hay cao
+    eqGains[0] = speakingF0 < 150.0 ? -3.8 : -2.2;
     for (int i = 1; i < 5; i++) {
       final double currentRel = measuredBands[i] - midRef;
       final double diff = targetRelativeCurve[i] - currentRel;
-      eqGains[i] = (diff * 0.45).clamp(-4.5, 5.0);
+      eqGains[i] = (diff * 0.65).clamp(-5.5, 6.0);
     }
-    // Đảm bảo dải Presence (3.5kHz) và Air (10kHz) luôn có độ nâng hợp lý giúp giọng bay và bắt mic
-    eqGains[3] = eqGains[3].clamp(1.2, 4.8);
-    eqGains[4] = eqGains[4].clamp(1.0, 4.5);
 
     return UserVoiceProfile(
       id: 'profile_${DateTime.now().millisecondsSinceEpoch}',

@@ -22,12 +22,10 @@ class _WizardStepInfo {
 /// Màn hình Chuỗi 4 Bước Thu & Phân Tích Đặc Trưng Giọng Nói của người dùng
 class VoiceProfilingWizardScreen extends StatefulWidget {
   final AppController controller;
-  final VoidCallback onJumpToStudio;
 
   const VoiceProfilingWizardScreen({
     super.key,
     required this.controller,
-    required this.onJumpToStudio,
   });
 
   @override
@@ -43,17 +41,18 @@ class _VoiceProfilingWizardScreenState
     _WizardStepInfo(
       index: 0,
       title: 'Bước 1: Đo Tạp Âm Phòng & Giọng Nói Tự Nhiên',
-      subtitle: 'Giữ im lặng 1 giây rồi đọc to câu bên dưới ở âm lượng bình thường',
-      promptText:
-          '"Xin chào, hôm nay tôi thử giọng để hệ thống cân chỉnh âm thanh Karaoke phù hợp nhất."',
+      subtitle: 'Giữ im lặng 1 giây đầu rồi nói tự nhiên câu gợi ý (không bắt buộc đúng từng chữ)',
+      promptText: '"Xin chào, bắt đầu phân tích giọng nói"',
       targetFeature: 'Trích xuất: Noise Floor (dB), F0 trung bình & Trọng tâm phổ (Spectral Centroid)',
     ),
     _WizardStepInfo(
       index: 1,
-      title: 'Bước 2: Đo Quãng Giọng (Pitch Range Glide)',
-      subtitle: 'Ngân âm "Aaaa..." trượt từ nốt trầm nhất lên nốt cao nhất mà bạn thấy thoải mái',
-      promptText: '"Aaaaaaaa... (Trầm -> Trung -> Cao)"',
-      targetFeature: 'Trích xuất: Quãng giọng (Bass/Baritone/Tenor/Alto/Soprano) & Vùng giọng đẹp nhất',
+      title: 'Bước 2: Đo Quãng Giọng (Thang Âm Đồ ↗ Đố)',
+      subtitle:
+          'Hát nâng cao tông dần từng bậc (không đọc ngang giọng) và ngân dài chữ "Đố" cuối ở nốt cao nhất bạn lên tới',
+      promptText: '"Đồ ↗ Rê ↗ Mi ↗ Pha ↗ Son ↗ La ↗ Si ↗ Đố..."',
+      targetFeature:
+          'Trích xuất: Quãng giọng (Bass/Baritone/Tenor/Alto/Soprano), Độ mở bán cung & Vùng giọng đẹp nhất',
     ),
     _WizardStepInfo(
       index: 2,
@@ -200,6 +199,35 @@ class _VoiceProfilingWizardScreenState
                         height: 1.35,
                       ),
                     ),
+                    if (_activeStep == 1) ...[
+                      const SizedBox(height: 12),
+                      _buildDoReMiStaircaseVisual(),
+                      const SizedBox(height: 10),
+                      OutlinedButton.icon(
+                        style: OutlinedButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                          side: BorderSide(
+                            color: AppTheme.accentAmber.withValues(alpha: 0.6),
+                          ),
+                        ),
+                        onPressed: ctrl.isRecordingWizard
+                            ? null
+                            : ctrl.playDoReMiGuideTone,
+                        icon: const Icon(
+                          Icons.volume_up_rounded,
+                          size: 16,
+                          color: AppTheme.accentAmber,
+                        ),
+                        label: const Text(
+                          'Nghe Giai Điệu Mẫu (Đồ ↗ Đố)',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w700,
+                            color: AppTheme.accentAmber,
+                          ),
+                        ),
+                      ),
+                    ],
                   ],
                 ),
               ),
@@ -276,16 +304,22 @@ class _VoiceProfilingWizardScreenState
                 ],
               ),
 
-              // Hiển thị kết quả đo của bước này nếu đã đo xong
+              // Hiển thị kết quả đo & Kiểm định chất lượng (QC) của bước này nếu đã đo xong
               if (metrics != null) ...[
                 const SizedBox(height: 16),
                 Container(
                   padding: const EdgeInsets.all(12),
                   decoration: BoxDecoration(
-                    color: AppTheme.accentEmerald.withValues(alpha: 0.1),
+                    color: (metrics.isQualityValid
+                            ? AppTheme.accentEmerald
+                            : AppTheme.accentAmber)
+                        .withValues(alpha: 0.1),
                     borderRadius: BorderRadius.circular(12),
                     border: Border.all(
-                      color: AppTheme.accentEmerald.withValues(alpha: 0.4),
+                      color: (metrics.isQualityValid
+                              ? AppTheme.accentEmerald
+                              : AppTheme.accentAmber)
+                          .withValues(alpha: 0.45),
                     ),
                   ),
                   child: Column(
@@ -293,27 +327,49 @@ class _VoiceProfilingWizardScreenState
                     children: [
                       Row(
                         children: [
-                          const Icon(
-                            Icons.verified_rounded,
-                            color: AppTheme.accentEmerald,
+                          Icon(
+                            metrics.isQualityValid
+                                ? Icons.verified_rounded
+                                : Icons.warning_amber_rounded,
+                            color: metrics.isQualityValid
+                                ? AppTheme.accentEmerald
+                                : AppTheme.accentAmber,
                             size: 18,
                           ),
                           const SizedBox(width: 6),
-                          Text(
-                            'Kết quả trích xuất Bước ${_activeStep + 1}:',
-                            style: const TextStyle(
-                              fontWeight: FontWeight.w700,
-                              color: AppTheme.accentEmerald,
-                              fontSize: 13,
+                          Expanded(
+                            child: Text(
+                              metrics.isQualityValid
+                                  ? 'Bản thu đạt chuẩn (Bước ${_activeStep + 1})'
+                                  : 'Cần lưu ý chất lượng thu (Bước ${_activeStep + 1})',
+                              style: TextStyle(
+                                fontWeight: FontWeight.w700,
+                                color: metrics.isQualityValid
+                                    ? AppTheme.accentEmerald
+                                    : AppTheme.accentAmber,
+                                fontSize: 13,
+                              ),
                             ),
                           ),
                         ],
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        metrics.qualityFeedback,
+                        style: const TextStyle(
+                          fontSize: 12,
+                          color: AppTheme.textPrimary,
+                        ),
                       ),
                       const SizedBox(height: 8),
                       Wrap(
                         spacing: 12,
                         runSpacing: 6,
                         children: [
+                          _metricTag(
+                            'SNR (Độ rõ/Ồn)',
+                            '+${metrics.snrDb.toStringAsFixed(1)} dB',
+                          ),
                           _metricTag(
                             'F0 Trung bình',
                             '${metrics.meanPitchHz.toStringAsFixed(1)} Hz',
@@ -344,38 +400,50 @@ class _VoiceProfilingWizardScreenState
               const SizedBox(height: 14),
               // Nút chuyển bước tiếp theo hoặc Hoàn tất Hồ sơ giọng
               Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  if (_activeStep > 0)
+                  if (_activeStep > 0) ...[
                     TextButton.icon(
+                      style: TextButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(horizontal: 10),
+                      ),
                       onPressed: () => setState(() => _activeStep--),
                       icon: const Icon(Icons.arrow_back_ios_new, size: 14),
                       label: const Text('Bước trước'),
-                    )
-                  else
-                    const SizedBox.shrink(),
-                  if (_activeStep < 3)
+                    ),
+                    const SizedBox(width: 8),
+                  ] else
+                    const Spacer(),
+                  if (_activeStep < 3) ...[
+                    if (_activeStep > 0) const Spacer(),
                     FilledButton.tonalIcon(
                       onPressed: () => setState(() => _activeStep++),
                       icon: const Icon(Icons.arrow_forward_ios, size: 14),
                       label: Text('Sang Bước ${_activeStep + 2}'),
-                    )
-                  else
-                    FilledButton.icon(
-                      style: FilledButton.styleFrom(
-                        backgroundColor: AppTheme.accentEmerald,
-                        foregroundColor: Colors.black,
-                      ),
-                      onPressed: ctrl.isBusyProcessing
-                          ? null
-                          : () async {
-                              await ctrl.finalizeVoiceProfileFromWizard();
-                              widget.onJumpToStudio();
-                            },
-                      icon: const Icon(Icons.check_circle_outline),
-                      label: const Text(
-                        'Hoàn Tất & Chuyển Sang Studio Karaoke',
-                        style: TextStyle(fontWeight: FontWeight.w800),
+                    ),
+                  ] else
+                    Expanded(
+                      child: FilledButton.icon(
+                        style: FilledButton.styleFrom(
+                          backgroundColor: AppTheme.accentEmerald,
+                          foregroundColor: Colors.black,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 12,
+                          ),
+                        ),
+                        onPressed: ctrl.isBusyProcessing
+                            ? null
+                            : () => _handleAnalyzeAndSaveDialog(ctrl),
+                        icon: const Icon(Icons.analytics_outlined, size: 18),
+                        label: const Text(
+                          'Phân tích',
+                          overflow: TextOverflow.ellipsis,
+                          maxLines: 1,
+                          style: TextStyle(
+                            fontWeight: FontWeight.w800,
+                            fontSize: 13.5,
+                          ),
+                        ),
                       ),
                     ),
                 ],
@@ -387,8 +455,107 @@ class _VoiceProfilingWizardScreenState
     );
   }
 
+  Future<void> _handleAnalyzeAndSaveDialog(AppController ctrl) async {
+    final previewProfile = await ctrl.analyze4StepsForPreview();
+    if (!mounted) return;
+
+    final nameController = TextEditingController(text: previewProfile.name);
+    final savedName = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) {
+        return AlertDialog(
+          backgroundColor: AppTheme.cardDark,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(18),
+            side: BorderSide(color: AppTheme.accentCyan.withValues(alpha: 0.4)),
+          ),
+          title: const Row(
+            children: [
+              Icon(Icons.save_alt_rounded, color: AppTheme.accentCyan, size: 22),
+              SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'Lưu Hồ Sơ Giọng Của Bạn',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+                ),
+              ),
+            ],
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Phân loại: ${previewProfile.vocalType.title} (${previewProfile.minPitchHz.round()}–${previewProfile.maxPitchHz.round()}Hz)',
+                style: const TextStyle(
+                  fontSize: 12.5,
+                  color: AppTheme.accentEmerald,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 12),
+              const Text(
+                'Nhập tên gợi nhớ cho giọng này (để chọn lại nhanh những lần mở app sau):',
+                style: TextStyle(fontSize: 12.5, color: AppTheme.textSecondary),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: nameController,
+                autofocus: true,
+                style: const TextStyle(color: Colors.white, fontSize: 14),
+                decoration: InputDecoration(
+                  hintText: 'VD: Giọng Nam Phòng Khách, Giọng Hát Bolero...',
+                  filled: true,
+                  fillColor: AppTheme.bgDark,
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(null),
+              child: const Text('Hủy'),
+            ),
+            FilledButton.icon(
+              style: FilledButton.styleFrom(
+                backgroundColor: AppTheme.accentEmerald,
+                foregroundColor: Colors.black,
+              ),
+              onPressed: () => Navigator.of(ctx).pop(nameController.text),
+              icon: const Icon(Icons.check_rounded, size: 18),
+              label: const Text(
+                'Lưu Giọng',
+                style: TextStyle(fontWeight: FontWeight.w800),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (savedName != null && mounted) {
+      await ctrl.saveAnalyzedVoiceProfile(previewProfile, savedName);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Đã lưu "${ctrl.voiceProfile.name}"! Bạn có thể bấm sang tab "2. Làm Đẹp Karaoke" ở dưới.',
+            ),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+    }
+  }
+
   Widget _buildProfileSummaryCard(AppController ctrl, int completedCount) {
     final profile = ctrl.voiceProfile;
+    final savedList = ctrl.savedProfiles;
+
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
@@ -399,6 +566,83 @@ class _VoiceProfilingWizardScreenState
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // Hộp chọn nhanh trong Danh sách các giọng đã lưu (mặc định chọn giọng mới nhất)
+          if (savedList.isNotEmpty) ...[
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+              decoration: BoxDecoration(
+                color: AppTheme.bgDark,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(
+                  color: AppTheme.accentCyan.withValues(alpha: 0.4),
+                ),
+              ),
+              child: Row(
+                children: [
+                  const Icon(
+                    Icons.folder_shared_rounded,
+                    color: AppTheme.accentCyan,
+                    size: 18,
+                  ),
+                  const SizedBox(width: 8),
+                  const Text(
+                    'Giọng đã lưu:',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: AppTheme.textSecondary,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: DropdownButtonHideUnderline(
+                      child: DropdownButton<String>(
+                        value: savedList.any((e) => e.id == profile.id)
+                            ? profile.id
+                            : savedList.first.id,
+                        isExpanded: true,
+                        dropdownColor: AppTheme.cardElevated,
+                        style: const TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.white,
+                        ),
+                        items: savedList.map((item) {
+                          return DropdownMenuItem<String>(
+                            value: item.id,
+                            child: Text(
+                              '${item.name} (${item.vocalType.title.split(' ').first})',
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          );
+                        }).toList(),
+                        onChanged: (selectedId) {
+                          if (selectedId == null) return;
+                          final found = savedList.firstWhere(
+                            (e) => e.id == selectedId,
+                            orElse: () => savedList.first,
+                          );
+                          ctrl.selectSavedVoiceProfile(found);
+                        },
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Xóa hồ sơ giọng đang chọn',
+                    visualDensity: VisualDensity.compact,
+                    onPressed: () => ctrl.deleteSavedVoiceProfile(profile.id),
+                    icon: const Icon(
+                      Icons.delete_outline_rounded,
+                      size: 18,
+                      color: AppTheme.accentRose,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+          ],
+
           Row(
             children: [
               Expanded(
@@ -407,23 +651,32 @@ class _VoiceProfilingWizardScreenState
                   children: [
                     Row(
                       children: [
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 8,
-                            vertical: 3,
-                          ),
-                          decoration: BoxDecoration(
-                            color: AppTheme.accentCyan.withValues(alpha: 0.18),
-                            borderRadius: BorderRadius.circular(8),
-                          ),
-                          child: Text(
-                            ctrl.hasCustomProfile
-                                ? 'ĐÃ ĐO CÁ NHÂN HÓA'
-                                : 'HỒ SƠ MẪU SẴN SÀNG ($completedCount/4 BƯỚC)',
-                            style: const TextStyle(
-                              fontSize: 10.5,
-                              fontWeight: FontWeight.w800,
-                              color: AppTheme.accentCyan,
+                        Flexible(
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 3,
+                            ),
+                            decoration: BoxDecoration(
+                              color: (ctrl.hasCustomProfile
+                                      ? AppTheme.accentEmerald
+                                      : AppTheme.accentAmber)
+                                  .withValues(alpha: 0.18),
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: Text(
+                              ctrl.hasCustomProfile
+                                  ? 'ĐANG CHỌN: ${profile.name.toUpperCase()}'
+                                  : 'CHƯA CÓ GIỌNG LƯU ($completedCount/4 BƯỚC)',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 10.5,
+                                fontWeight: FontWeight.w800,
+                                color: ctrl.hasCustomProfile
+                                    ? AppTheme.accentEmerald
+                                    : AppTheme.accentAmber,
+                              ),
                             ),
                           ),
                         ),
@@ -448,18 +701,26 @@ class _VoiceProfilingWizardScreenState
                   ],
                 ),
               ),
-              FilledButton.tonal(
-                onPressed: ctrl.isBusyProcessing
-                    ? null
-                    : () async {
-                        await ctrl.finalizeVoiceProfileFromWizard();
-                        widget.onJumpToStudio();
-                      },
-                child: const Text(
-                  'Áp dụng ngay',
-                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+              if (completedCount > 0)
+                OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    side: BorderSide(
+                      color: Colors.white.withValues(alpha: 0.2),
+                    ),
+                  ),
+                  onPressed: ctrl.isBusyProcessing
+                      ? null
+                      : () {
+                          ctrl.resetWizardSteps();
+                          setState(() => _activeStep = 0);
+                        },
+                  icon: const Icon(Icons.refresh_rounded, size: 16),
+                  label: const Text(
+                    'Đo lại',
+                    style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                  ),
                 ),
-              ),
             ],
           ),
           const SizedBox(height: 8),
@@ -553,6 +814,52 @@ class _VoiceProfilingWizardScreenState
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  /// Minh họa trực quan 8 bậc thang cao độ Đồ -> Đố đi lên để người dùng hát nâng tông theo
+  Widget _buildDoReMiStaircaseVisual() {
+    const notes = ['Đồ', 'Rê', 'Mi', 'Pha', 'Son', 'La', 'Si', 'Đố'];
+    return SizedBox(
+      height: 68,
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: List.generate(notes.length, (i) {
+          final double barHeight = 10.0 + i * 4.5;
+          return Expanded(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                Text(
+                  notes[i],
+                  style: TextStyle(
+                    fontSize: 10.5,
+                    fontWeight: FontWeight.w700,
+                    color: i >= 5 ? AppTheme.accentCyan : AppTheme.textPrimary,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Container(
+                  height: barHeight,
+                  margin: const EdgeInsets.symmetric(horizontal: 3),
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.bottomCenter,
+                      end: Alignment.topCenter,
+                      colors: [
+                        AppTheme.primaryNeon.withValues(alpha: 0.65),
+                        AppTheme.accentCyan,
+                      ],
+                    ),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                ),
+              ],
+            ),
+          );
+        }),
       ),
     );
   }

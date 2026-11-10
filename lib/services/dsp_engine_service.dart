@@ -9,17 +9,25 @@ import 'voice_analyzer_service.dart';
 /// Báo cáo kết quả sau khi chạy Pipeline làm đẹp Karaoke để hiển thị lên UI
 class DspProcessingReport {
   final PcmAudioData outputAudio;
+  final PcmAudioData vocalOnlyAudio;
+  final PcmAudioData musicOnlyAudio;
   final int pitchCorrectedFrames;
   final double averageGainReductionDb;
   final double peakOutputDb;
   final int processingTimeMs;
+  final double trackOriginalF0Hz;
+  final double appliedSemitoneShift;
 
   const DspProcessingReport({
     required this.outputAudio,
+    required this.vocalOnlyAudio,
+    required this.musicOnlyAudio,
     required this.pitchCorrectedFrames,
     required this.averageGainReductionDb,
     required this.peakOutputDb,
     required this.processingTimeMs,
+    this.trackOriginalF0Hz = 180.0,
+    this.appliedSemitoneShift = 0.0,
   });
 }
 
@@ -61,6 +69,21 @@ class DspEngineService {
     // Bước 1: Khử tạp âm nền (Smooth Noise Gate) & Giảm âm xì chói (Dynamic De-esser)
     if (params.enableNoiseGateAndDeEsser && intensity > 0.01) {
       _applyNoiseGateAndDeEsser(vLeft, vRight, sr, params, intensity);
+    }
+
+    // Bước 1.5: Áp Đặc Trưng Quãng Giọng & Âm Sắc của Giọng Đã Lưu lên bản thu (Voice Timbre & Pitch Adaptation)
+    double trackF0Hz = 180.0;
+    double appliedSemitones = 0.0;
+    if (params.enableVoiceConversion && params.voiceConversionStrength > 0.05) {
+      final convResult = _applyVoiceProfileConversion(
+        vLeft,
+        vRight,
+        sr,
+        params,
+        intensity,
+      );
+      trackF0Hz = convResult.detectedTrackF0Hz;
+      appliedSemitones = convResult.semitoneShift;
     }
 
     // Bước 2: Pitch Correction / Auto-Tune (Kéo các khung bị phô về đúng cao độ nốt nhạc)
@@ -107,12 +130,17 @@ class DspEngineService {
 
     final Float64List outL = Float64List(n);
     final Float64List outR = Float64List(n);
+    final Float64List vocalSoloL = Float64List(n);
+    final Float64List vocalSoloR = Float64List(n);
     double peakAbs = 1e-5;
     double vocalEnv = 0.0;
 
     for (int i = 0; i < n; i++) {
       final double vl = vLeft[i] * vocalGainLinear;
       final double vr = vRight[i] * vocalGainLinear;
+
+      vocalSoloL[i] = _softClipLimiter(vl);
+      vocalSoloR[i] = _softClipLimiter(vr);
 
       // Đo bao hình giọng hát để tự động dìm nhẹ nhạc nền 1.5dB khi người dùng lên giọng (Smart Ducking)
       final double vAbs = 0.5 * (vl.abs() + vr.abs());
@@ -150,11 +178,168 @@ class DspEngineService {
         leftChannel: outL,
         rightChannel: outR,
       ),
+      vocalOnlyAudio: PcmAudioData(
+        sampleRate: sr,
+        channels: 2,
+        leftChannel: vocalSoloL,
+        rightChannel: vocalSoloR,
+      ),
+      musicOnlyAudio: musicStem,
       pitchCorrectedFrames: correctedFrames,
       averageGainReductionDb: avgGainReductionDb,
       peakOutputDb: peakDb,
       processingTimeMs: sw.elapsedMilliseconds,
+      trackOriginalF0Hz: trackF0Hz,
+      appliedSemitoneShift: appliedSemitones,
     );
+  }
+
+  /// Đo tần số F0 trung vị của bản thu và dịch chuyển Quãng Giọng (Pitch Transpose) + Vòm Họng (Formant/Timbre)
+  /// để biến luồng giọng trong file khớp với đặc trưng Giọng Đã Lưu của người dùng!
+  _VoiceConversionResult _applyVoiceProfileConversion(
+    Float64List left,
+    Float64List right,
+    int sr,
+    DspParameters params,
+    double intensity,
+  ) {
+    const int frameSize = 1024;
+    const int hop = 1024;
+    final List<double> pitches = [];
+
+    // 1. Đo tần số cơ bản (F0) thực tế của giọng hát trong file đầu vào
+    for (int start = 0; start + frameSize <= left.length; start += hop) {
+      final mono = Float64List(frameSize);
+      double sumSq = 0.0;
+      for (int i = 0; i < frameSize; i++) {
+        final m = 0.5 * (left[start + i] + right[start + i]);
+        mono[i] = m;
+        sumSq += m * m;
+      }
+      if (sumSq / frameSize > 2e-4) {
+        final p = _analyzer.detectPitchYin(mono, sr);
+        if (p >= 80.0 && p <= 750.0) {
+          pitches.add(p);
+        }
+      }
+    }
+
+    double trackF0 = 185.0;
+    if (pitches.isNotEmpty) {
+      pitches.sort();
+      trackF0 = pitches[pitches.length ~/ 2]; // Trung vị F0 của ca sĩ trong file
+    }
+
+    // Vì khi hát cao độ thường cao hơn khi nói khoảng 1.22 lần (~3.5 bán cung),
+    // ta quy đổi F0 nói của Hồ sơ giọng sang F0 hát mục tiêu:
+    final double targetSingingF0 =
+        (params.targetProfileF0Hz * 1.22).clamp(95.0, 480.0);
+
+    // Tính độ chênh bán cung giữa Giọng đã lưu và Giọng trong file
+    final double rawSemitoneDiff =
+        12.0 * (math.log(targetSingingF0 / trackF0) / math.ln2);
+    final double convStrength =
+        (params.voiceConversionStrength * intensity.clamp(0.5, 1.3))
+            .clamp(0.0, 1.0);
+
+    double semitoneShift = 0.0;
+    if (rawSemitoneDiff.abs() >= 3.5) {
+      // Khác giới tính hoặc khác quãng giọng lớn (VD: Áp giọng Nam vào diem_xua_nu.wav hoặc ngược lại)
+      // Làm tròn về số nguyên bán cung (hoặc quãng 4 / quãng 5 / quãng 8) để không bị lệch tông với nhạc nền!
+      final double scaled = (rawSemitoneDiff * 0.78 * convStrength).clamp(-12.0, 12.0);
+      semitoneShift = scaled.roundToDouble();
+    } else if (rawSemitoneDiff.abs() >= 1.2) {
+      // Cùng giới tính (VD: Nam Trầm 110Hz vs Nam Cao 165Hz) -> Dịch nhẹ màu âm & độ trầm/thanh
+      semitoneShift = (rawSemitoneDiff * 0.45 * convStrength).clamp(-3.0, 3.0);
+    }
+
+    // 2. Thực hiện Dual-Grain Hann Window Pitch & Formant Shifting (không làm thay đổi tốc độ bài hát)
+    if (semitoneShift.abs() >= 0.35) {
+      final double pitchRatio =
+          math.pow(2.0, semitoneShift / 12.0).toDouble().clamp(0.5, 2.0);
+      _olaPitchShiftInPlace(left, right, sr, pitchRatio);
+    }
+
+    // 3. Áp dấu vân tay Vòm Họng (Vocal Tract Formant Fingerprint) theo F0 và Spectral Centroid của giọng đã lưu
+    // Giúp phân biệt rõ ràng ngay cả giữa 2 giọng cùng là Nam (VD: Giọng Nam 1 ấm/dày vs Giọng Nam 2 thanh/sáng)
+    final double chestGainDb =
+        ((165.0 - params.targetProfileF0Hz) / 14.0).clamp(-4.5, 5.5) * convStrength;
+    final double throatFormantFreq =
+        (params.targetProfileF0Hz * 4.5).clamp(480.0, 1150.0);
+    final double throatGainDb =
+        ((params.targetProfileCentroidHz - 1800.0) / 220.0).clamp(-4.0, 4.5) * convStrength;
+    final double brightnessDb =
+        ((params.targetProfileCentroidHz - 1750.0) / 180.0).clamp(-4.5, 5.5) * convStrength;
+
+    final chestL = _BiquadFilter.peaking(sr, 195.0, 0.9, chestGainDb);
+    final chestR = _BiquadFilter.peaking(sr, 195.0, 0.9, chestGainDb);
+    final throatL = _BiquadFilter.peaking(sr, throatFormantFreq, 1.4, throatGainDb);
+    final throatR = _BiquadFilter.peaking(sr, throatFormantFreq, 1.4, throatGainDb);
+    final brightL = _BiquadFilter.highShelf(sr, 3200.0, brightnessDb);
+    final brightR = _BiquadFilter.highShelf(sr, 3200.0, brightnessDb);
+
+    for (int i = 0; i < left.length; i++) {
+      left[i] = brightL.process(throatL.process(chestL.process(left[i])));
+      right[i] = brightR.process(throatR.process(chestR.process(right[i])));
+    }
+
+    return _VoiceConversionResult(
+      detectedTrackF0Hz: trackF0,
+      semitoneShift: semitoneShift,
+    );
+  }
+
+  /// Bộ dịch cao độ thời gian thực Dual-Delay-Line Granular Pitch Shifter (bảo toàn thời lượng bài hát)
+  void _olaPitchShiftInPlace(
+    Float64List left,
+    Float64List right,
+    int sr,
+    double pitchRatio,
+  ) {
+    final int n = left.length;
+    final Float64List srcL = Float64List.fromList(left);
+    final Float64List srcR = Float64List.fromList(right);
+
+    const int grainSize = 1536; // ~35ms tại 44.1kHz (chuẩn mượt cho giọng hát)
+    final double rate = 1.0 - pitchRatio;
+    double phaseA = 0.0;
+    double phaseB = grainSize / 2.0;
+
+    for (int i = 0; i < n; i++) {
+      phaseA += rate;
+      if (phaseA >= grainSize) phaseA -= grainSize;
+      if (phaseA < 0) phaseA += grainSize;
+
+      phaseB += rate;
+      if (phaseB >= grainSize) phaseB -= grainSize;
+      if (phaseB < 0) phaseB += grainSize;
+
+      final double winA =
+          0.5 * (1.0 - math.cos(2.0 * math.pi * phaseA / grainSize));
+      final double winB =
+          0.5 * (1.0 - math.cos(2.0 * math.pi * phaseB / grainSize));
+
+      final double posA = (i - phaseA).clamp(0.0, (n - 2).toDouble());
+      final double posB = (i - phaseB).clamp(0.0, (n - 2).toDouble());
+
+      final int idxA = posA.floor();
+      final double fracA = posA - idxA;
+      final int idxB = posB.floor();
+      final double fracB = posB - idxB;
+
+      final double sampleLA =
+          srcL[idxA] * (1.0 - fracA) + srcL[idxA + 1] * fracA;
+      final double sampleLB =
+          srcL[idxB] * (1.0 - fracB) + srcL[idxB + 1] * fracB;
+
+      final double sampleRA =
+          srcR[idxA] * (1.0 - fracA) + srcR[idxA + 1] * fracA;
+      final double sampleRB =
+          srcR[idxB] * (1.0 - fracB) + srcR[idxB + 1] * fracB;
+
+      left[i] = sampleLA * winA + sampleLB * winB;
+      right[i] = sampleRA * winA + sampleRB * winB;
+    }
   }
 
   void _applyNoiseGateAndDeEsser(
@@ -284,30 +469,31 @@ class DspEngineService {
     DspParameters params,
     double intensity,
   ) {
+    final double eqScale = (intensity * 1.45).clamp(0.0, 2.2);
     final List<_BiquadFilter> filtersL = [
-      _BiquadFilter.lowShelf(sr, 105.0, params.eqSub100HzDb * intensity),
-      _BiquadFilter.peaking(sr, 280.0, 1.1, params.eqLowMid280HzDb * intensity),
-      _BiquadFilter.peaking(sr, 1200.0, 1.2, params.eqMid1200HzDb * intensity),
+      _BiquadFilter.lowShelf(sr, 115.0, params.eqSub100HzDb * eqScale),
+      _BiquadFilter.peaking(sr, 280.0, 0.9, params.eqLowMid280HzDb * eqScale),
+      _BiquadFilter.peaking(sr, 1200.0, 1.0, params.eqMid1200HzDb * eqScale),
       _BiquadFilter.peaking(
         sr,
-        3500.0,
-        1.1,
-        params.eqHighMid3500HzDb * intensity,
+        3400.0,
+        0.85,
+        params.eqHighMid3500HzDb * eqScale,
       ),
-      _BiquadFilter.highShelf(sr, 9500.0, params.eqAir10kHzDb * intensity),
+      _BiquadFilter.highShelf(sr, 8500.0, params.eqAir10kHzDb * eqScale),
     ];
 
     final List<_BiquadFilter> filtersR = [
-      _BiquadFilter.lowShelf(sr, 105.0, params.eqSub100HzDb * intensity),
-      _BiquadFilter.peaking(sr, 280.0, 1.1, params.eqLowMid280HzDb * intensity),
-      _BiquadFilter.peaking(sr, 1200.0, 1.2, params.eqMid1200HzDb * intensity),
+      _BiquadFilter.lowShelf(sr, 115.0, params.eqSub100HzDb * eqScale),
+      _BiquadFilter.peaking(sr, 280.0, 0.9, params.eqLowMid280HzDb * eqScale),
+      _BiquadFilter.peaking(sr, 1200.0, 1.0, params.eqMid1200HzDb * eqScale),
       _BiquadFilter.peaking(
         sr,
-        3500.0,
-        1.1,
-        params.eqHighMid3500HzDb * intensity,
+        3400.0,
+        0.85,
+        params.eqHighMid3500HzDb * eqScale,
       ),
-      _BiquadFilter.highShelf(sr, 9500.0, params.eqAir10kHzDb * intensity),
+      _BiquadFilter.highShelf(sr, 8500.0, params.eqAir10kHzDb * eqScale),
     ];
 
     for (int i = 0; i < left.length; i++) {
@@ -394,16 +580,16 @@ class DspEngineService {
     // 4 đường Comb Filter song song + 2 đường All-pass Filter (Cấu trúc Schroeder/Freeverb)
     final double scale = sr / 44100.0;
     final List<_CombFilter> combsL = [
-      _CombFilter((1116 * scale).round(), 0.72 * roomSize, damping),
-      _CombFilter((1188 * scale).round(), 0.70 * roomSize, damping),
-      _CombFilter((1277 * scale).round(), 0.68 * roomSize, damping),
-      _CombFilter((1356 * scale).round(), 0.66 * roomSize, damping),
+      _CombFilter((1310 * scale).round(), (0.64 + 0.16 * roomSize).clamp(0.55, 0.80), damping),
+      _CombFilter((1385 * scale).round(), (0.63 + 0.16 * roomSize).clamp(0.54, 0.79), damping),
+      _CombFilter((1245 * scale).round(), (0.62 + 0.16 * roomSize).clamp(0.53, 0.78), damping),
+      _CombFilter((1180 * scale).round(), (0.60 + 0.16 * roomSize).clamp(0.52, 0.76), damping),
     ];
     final List<_CombFilter> combsR = [
-      _CombFilter(((1116 + 23) * scale).round(), 0.72 * roomSize, damping),
-      _CombFilter(((1188 + 23) * scale).round(), 0.70 * roomSize, damping),
-      _CombFilter(((1277 + 23) * scale).round(), 0.68 * roomSize, damping),
-      _CombFilter(((1356 + 23) * scale).round(), 0.66 * roomSize, damping),
+      _CombFilter(((1310 + 29) * scale).round(), (0.64 + 0.16 * roomSize).clamp(0.55, 0.80), damping),
+      _CombFilter(((1385 + 29) * scale).round(), (0.63 + 0.16 * roomSize).clamp(0.54, 0.79), damping),
+      _CombFilter(((1245 + 29) * scale).round(), (0.62 + 0.16 * roomSize).clamp(0.53, 0.78), damping),
+      _CombFilter(((1180 + 29) * scale).round(), (0.60 + 0.16 * roomSize).clamp(0.52, 0.76), damping),
     ];
 
     final _AllPassFilter apL1 = _AllPassFilter((556 * scale).round(), 0.5);
@@ -427,9 +613,9 @@ class DspEngineService {
       dIdxL = (dIdxL + 1) % delaySamplesL;
       dIdxR = (dIdxR + 1) % delaySamplesR;
 
-      // 2. Tính Stereo Reverb
-      final double revInL = reverbHpL.process(dryL) * 0.25;
-      final double revInR = reverbHpR.process(dryR) * 0.25;
+      // 2. Tính Stereo Reverb (cân chỉnh độ vang vừa phải, trong trẻo không bị ù/nhòe)
+      final double revInL = reverbHpL.process(dryL) * 0.30;
+      final double revInR = reverbHpR.process(dryR) * 0.30;
       double revOutL = 0.0;
       double revOutR = 0.0;
       for (int c = 0; c < 4; c++) {
@@ -439,12 +625,12 @@ class DspEngineService {
       revOutL = apL2.process(apL1.process(revOutL));
       revOutR = apR2.process(apR1.process(revOutR));
 
-      left[i] = dryL * (1.0 - wetReverb * 0.25) +
-          delOutL * wetDelay +
-          revOutL * wetReverb;
-      right[i] = dryR * (1.0 - wetReverb * 0.25) +
-          delOutR * wetDelay +
-          revOutR * wetReverb;
+      left[i] = dryL * (1.0 - wetReverb * 0.15) +
+          delOutL * wetDelay * 0.90 +
+          revOutL * wetReverb * 0.95;
+      right[i] = dryR * (1.0 - wetReverb * 0.15) +
+          delOutR * wetDelay * 0.90 +
+          revOutR * wetReverb * 0.95;
     }
   }
 
@@ -463,6 +649,16 @@ class DspEngineService {
     final double excess = x.abs() - 0.75;
     return sign * (0.75 + (ceiling - 0.75) * (1.0 - math.exp(-excess * 4.5)));
   }
+}
+
+class _VoiceConversionResult {
+  final double detectedTrackF0Hz;
+  final double semitoneShift;
+
+  const _VoiceConversionResult({
+    required this.detectedTrackF0Hz,
+    required this.semitoneShift,
+  });
 }
 
 class _CombFilter {

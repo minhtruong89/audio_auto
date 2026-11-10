@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:audioplayers/audioplayers.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart' show AssetManifest, rootBundle;
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -14,6 +16,14 @@ import '../models/voice_profile.dart';
 import '../services/audio_io_service.dart';
 import '../services/dsp_engine_service.dart';
 import '../services/voice_analyzer_service.dart';
+
+/// 4 chế độ nghe đối chiếu và kiểm tra chất lượng tách giọng (Stem Solo):
+enum AudioListenMode {
+  original, // Bản thu thô gốc (Before)
+  enhancedMix, // Bản đã tách + chuyển giọng + DSP + trộn lại (After)
+  vocalSolo, // Chỉ nghe riêng đường Giọng đã tách (Test độ sạch Vocal)
+  musicSolo, // Chỉ nghe riêng đường Nhạc nền đã tách (Test độ sạch Beat)
+}
 
 /// Quản lý trạng thái trung tâm của ứng dụng:
 /// - Hồ sơ giọng nói (4 bước đo + lưu trữ bền vững)
@@ -28,6 +38,7 @@ class AppController extends ChangeNotifier {
   final AudioPlayer _player = AudioPlayer();
 
   UserVoiceProfile _voiceProfile = UserVoiceProfile.defaultDemo();
+  final List<UserVoiceProfile> _savedProfiles = [];
   bool _hasCustomProfile = false;
 
   // Trạng thái 4 bước đo giọng (Wizard)
@@ -46,20 +57,24 @@ class AppController extends ChangeNotifier {
   String _currentTrackName = 'Bản thu Karaoke Mẫu (Giọng + Loa ngoài)';
   String? _originalFilePath;
   String? _enhancedFilePath;
+  String? _vocalSoloFilePath;
+  String? _musicSoloFilePath;
   PcmAudioData? _originalPcm;
   PcmAudioData? _enhancedPcm;
   DspProcessingReport? _lastReport;
 
   List<double> _originalWaveform = List<double>.filled(64, 0.2);
   List<double> _enhancedWaveform = List<double>.filled(64, 0.35);
+  List<double> _vocalSoloWaveform = List<double>.filled(64, 0.3);
+  List<double> _musicSoloWaveform = List<double>.filled(64, 0.25);
 
   bool _isBusyProcessing = false;
   bool _isRecordingKaraoke = false;
   String _statusMessage = 'Sẵn sàng xử lý âm thanh On-Device';
 
-  // Trạng thái trình phát đối chiếu A/B (Before vs After)
+  // Trạng thái trình phát đối chiếu A/B & Solo Stems
   bool _isPlaying = false;
-  bool _isListeningEnhanced = true; // true = Đã làm đẹp (After), false = Bản gốc (Before)
+  AudioListenMode _listenMode = AudioListenMode.enhancedMix;
   Duration _currentPosition = Duration.zero;
   Duration _totalDuration = const Duration(seconds: 8);
 
@@ -71,7 +86,8 @@ class AppController extends ChangeNotifier {
 
   // Getters
   UserVoiceProfile get voiceProfile => _voiceProfile;
-  bool get hasCustomProfile => _hasCustomProfile;
+  List<UserVoiceProfile> get savedProfiles => List.unmodifiable(_savedProfiles);
+  bool get hasCustomProfile => _savedProfiles.isNotEmpty || _hasCustomProfile;
   List<StepAnalysisMetrics?> get wizardSteps => List.unmodifiable(_wizardSteps);
   bool get isRecordingWizard => _isRecordingWizard;
   double get liveMicAmplitudeDb => _liveMicAmplitudeDb;
@@ -85,16 +101,21 @@ class AppController extends ChangeNotifier {
   String get currentTrackName => _currentTrackName;
   String? get originalFilePath => _originalFilePath;
   String? get enhancedFilePath => _enhancedFilePath;
+  String? get vocalSoloFilePath => _vocalSoloFilePath;
+  String? get musicSoloFilePath => _musicSoloFilePath;
   DspProcessingReport? get lastReport => _lastReport;
   List<double> get originalWaveform => _originalWaveform;
   List<double> get enhancedWaveform => _enhancedWaveform;
+  List<double> get vocalSoloWaveform => _vocalSoloWaveform;
+  List<double> get musicSoloWaveform => _musicSoloWaveform;
 
   bool get isBusyProcessing => _isBusyProcessing;
   bool get isRecordingKaraoke => _isRecordingKaraoke;
   String get statusMessage => _statusMessage;
 
   bool get isPlaying => _isPlaying;
-  bool get isListeningEnhanced => _isListeningEnhanced;
+  AudioListenMode get listenMode => _listenMode;
+  bool get isListeningEnhanced => _listenMode != AudioListenMode.original;
   Duration get currentPosition => _currentPosition;
   Duration get totalDuration => _totalDuration;
 
@@ -118,9 +139,30 @@ class AppController extends ChangeNotifier {
   Future<void> _initializeApp() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      final savedJson = prefs.getString('user_voice_profile_v1');
-      if (savedJson != null && savedJson.isNotEmpty) {
-        _voiceProfile = UserVoiceProfile.fromJson(savedJson);
+      final listJson = prefs.getString('saved_voice_profiles_list_v1');
+      if (listJson != null && listJson.isNotEmpty) {
+        final decoded = jsonDecode(listJson) as List<dynamic>;
+        _savedProfiles
+          ..clear()
+          ..addAll(
+            decoded.map(
+              (item) =>
+                  UserVoiceProfile.fromMap(item as Map<String, dynamic>),
+            ),
+          );
+      } else {
+        // Hỗ trợ nâng cấp từ bản lưu đơn cũ nếu có
+        final savedJson = prefs.getString('user_voice_profile_v1');
+        if (savedJson != null && savedJson.isNotEmpty) {
+          final legacy = UserVoiceProfile.fromJson(savedJson);
+          _savedProfiles.add(legacy);
+        }
+      }
+
+      if (_savedProfiles.isNotEmpty) {
+        // Sắp xếp giọng hoàn tất gần nhất lên đầu và mặc định chọn giọng đó
+        _savedProfiles.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+        _voiceProfile = _savedProfiles.first;
         _hasCustomProfile = true;
         _dspParams = DspParameters.fromVoiceProfile(_voiceProfile);
       }
@@ -184,7 +226,7 @@ class AppController extends ChangeNotifier {
       final path = await _recorder.stop();
       if (path != null && await File(path).exists()) {
         final pcm = await _audioIo.readWavFile(path);
-        final metrics = _analyzer.analyzeAudioClip(pcm);
+        final metrics = _analyzer.analyzeAudioClip(pcm, stepIndex: stepIndex);
         _wizardSteps[stepIndex] = metrics;
         _statusMessage = 'Đã hoàn tất phân tích Bước ${stepIndex + 1}!';
       } else {
@@ -206,7 +248,7 @@ class AppController extends ChangeNotifier {
 
     await Future<void>.delayed(const Duration(milliseconds: 350));
     final demoAudio = _audioIo.generateDemoKaraokeMix(durationSeconds: 3.5);
-    final metrics = _analyzer.analyzeAudioClip(demoAudio);
+    final metrics = _analyzer.analyzeAudioClip(demoAudio, stepIndex: stepIndex);
     _wizardSteps[stepIndex] = metrics;
 
     _isBusyProcessing = false;
@@ -214,54 +256,186 @@ class AppController extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Hoàn tất cả 4 bước và tổng hợp thành Hồ sơ Giọng của người dùng
-  Future<void> finalizeVoiceProfileFromWizard() async {
+  /// Phát thang âm mẫu "Đồ Rê Mi Pha Son La Si Đố" để người dùng nghe và bắt tông ở Bước 2
+  Future<void> playDoReMiGuideTone() async {
+    try {
+      await _player.stop();
+      final guidePcm = _audioIo.generateDoReMiGuideScale(durationSeconds: 3.6);
+      final dir = await getTemporaryDirectory();
+      final file = await _audioIo.writeWavFile(
+        guidePcm,
+        '${dir.path}/doremi_guide.wav',
+      );
+      _statusMessage =
+          'Đang phát thang âm mẫu: Đồ ↗ Rê ↗ Mi ↗ Pha ↗ Son ↗ La ↗ Si ↗ Đố...';
+      notifyListeners();
+      await _player.play(DeviceFileSource(file.path));
+    } catch (e) {
+      _statusMessage = 'Không thể phát âm mẫu ($e).';
+      notifyListeners();
+    }
+  }
+
+  /// Xóa kết quả 4 bước hiện tại để người dùng đo lại một hồ sơ giọng mới từ Bước 1
+  void resetWizardSteps() {
+    for (int i = 0; i < 4; i++) {
+      _wizardSteps[i] = null;
+    }
+    _statusMessage = 'Đã làm mới 4 bước! Hãy bắt đầu thu âm từ Bước 1.';
+    notifyListeners();
+  }
+
+  /// Phân tích tổng hợp từ 4 bước để tạo ra một [UserVoiceProfile] chờ người dùng đặt tên và lưu
+  Future<UserVoiceProfile> analyze4StepsForPreview() async {
     _isBusyProcessing = true;
-    _statusMessage = 'Đang tổng hợp Hồ sơ giọng & tính đường cong bù DSP...';
+    _statusMessage = 'Đang phân tích tổng hợp đặc trưng giọng 4 bước...';
     notifyListeners();
 
     for (int i = 0; i < 4; i++) {
       if (_wizardSteps[i] == null) {
         final demo = _audioIo.generateDemoKaraokeMix(durationSeconds: 2.5);
-        _wizardSteps[i] = _analyzer.analyzeAudioClip(demo);
+        _wizardSteps[i] = _analyzer.analyzeAudioClip(demo, stepIndex: i);
       }
     }
 
     final validSteps = _wizardSteps.whereType<StepAnalysisMetrics>().toList();
-    _voiceProfile = _analyzer.buildProfileFrom4Steps(validSteps);
-    _hasCustomProfile = true;
-
-    // Cập nhật ngay bộ tham số DSP tự động theo Hồ sơ giọng mới
-    _dspParams = DspParameters.fromVoiceProfile(_voiceProfile);
-
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('user_voice_profile_v1', _voiceProfile.toJson());
-    } catch (_) {}
-
-    // Tự động áp dụng hồ sơ giọng mới lên bản thu Karaoke hiện tại
-    await applyDspToCurrentTrack();
+    final analyzed = _analyzer.buildProfileFrom4Steps(validSteps);
+    final defaultName =
+        'Giọng của tôi #${_savedProfiles.length + 1} (${analyzed.vocalType.title.split(' ').first})';
+    final previewProfile = analyzed.copyWith(
+      name: defaultName,
+      createdAt: DateTime.now(),
+    );
 
     _isBusyProcessing = false;
-    _statusMessage = 'Đã lưu Hồ sơ giọng cá nhân & cập nhật bộ DSP Karaoke!';
+    _statusMessage = 'Phân tích hoàn tất! Hãy nhập tên để lưu hồ sơ giọng.';
     notifyListeners();
+    return previewProfile;
+  }
+
+  /// Lưu hồ sơ giọng đã phân tích với tên do người dùng đặt và chọn làm giọng mặc định
+  Future<void> saveAnalyzedVoiceProfile(
+    UserVoiceProfile profile,
+    String customName,
+  ) async {
+    final trimmed = customName.trim();
+    final finalProfile = profile.copyWith(
+      name: trimmed.isEmpty ? 'Giọng #${_savedProfiles.length + 1}' : trimmed,
+      createdAt: DateTime.now(),
+    );
+
+    _savedProfiles.removeWhere((p) => p.id == finalProfile.id);
+    _savedProfiles.insert(0, finalProfile); // Giọng mới nhất luôn ở vị trí đầu tiên
+    _voiceProfile = finalProfile;
+    _hasCustomProfile = true;
+    _dspParams = DspParameters.fromVoiceProfile(_voiceProfile);
+
+    await _persistSavedProfiles();
+    await applyDspToCurrentTrack();
+
+    _statusMessage =
+        'Đã lưu giọng "${finalProfile.name}"! Bạn có thể sang tab 2. Làm Đẹp Karaoke.';
+    notifyListeners();
+  }
+
+  /// Chọn một hồ sơ giọng đã lưu trong danh sách và cập nhật ngay theo chế độ hiện tại
+  Future<void> selectSavedVoiceProfile(UserVoiceProfile profile) async {
+    _voiceProfile = profile;
+    _hasCustomProfile = true;
+    if (_controlMode == StudioControlMode.smartPresets) {
+      _dspParams = DspParameters.fromPreset(
+        _selectedPreset,
+        _voiceProfile,
+        intensity: _presetIntensity,
+        vocalMusicBalance: _vocalMusicBalance,
+      );
+    } else {
+      _dspParams = DspParameters.fromVoiceProfile(_voiceProfile);
+    }
+    await applyDspToCurrentTrack();
+    _statusMessage = 'Đang áp dụng hồ sơ giọng "${profile.name}"';
+    notifyListeners();
+  }
+
+  /// Xóa một hồ sơ giọng khỏi danh sách đã lưu
+  Future<void> deleteSavedVoiceProfile(String id) async {
+    _savedProfiles.removeWhere((p) => p.id == id);
+    if (_savedProfiles.isNotEmpty) {
+      _voiceProfile = _savedProfiles.first;
+      _hasCustomProfile = true;
+      _dspParams = DspParameters.fromVoiceProfile(_voiceProfile);
+    } else {
+      _voiceProfile = UserVoiceProfile.defaultDemo();
+      _hasCustomProfile = false;
+    }
+    await _persistSavedProfiles();
+    notifyListeners();
+  }
+
+  Future<void> _persistSavedProfiles() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final listMap = _savedProfiles.map((e) => e.toMap()).toList();
+      await prefs.setString('saved_voice_profiles_list_v1', jsonEncode(listMap));
+      if (_savedProfiles.isNotEmpty) {
+        await prefs.setString(
+          'user_voice_profile_v1',
+          _savedProfiles.first.toJson(),
+        );
+      }
+    } catch (_) {}
   }
 
   // ===========================================================================
   // PHÂN HỆ 2: CHỌN FILE / THU ÂM KARAOKE & XỬ LÝ THEO 3 CHẾ ĐỘ
   // ===========================================================================
 
-  /// Tải bản thu Karaoke Mẫu (gồm Giọng hát + Loa ngoài + Tạp âm) để test ngay lập tức
-  Future<void> loadBuiltInDemoKaraoke() async {
+  /// Lấy danh sách tất cả các file âm thanh mẫu có trong thư mục `assets/audio/`
+  Future<List<String>> listAvailableSampleAssets() async {
+    const fallbackAssets = [
+      'assets/audio/diem_xua.wav',
+      'assets/audio/diem_xua_nu.wav',
+    ];
+    try {
+      final manifest = await AssetManifest.loadFromAssetBundle(rootBundle);
+      final found = manifest
+          .listAssets()
+          .where((path) => path.startsWith('assets/audio/'))
+          .toList()
+        ..sort();
+      return found.isNotEmpty ? found : fallbackAssets;
+    } catch (_) {
+      return fallbackAssets;
+    }
+  }
+
+  /// Tải một bản thu Karaoke mẫu cụ thể từ `assets/audio/` (mặc định là `diem_xua.wav`)
+  Future<void> loadBuiltInDemoKaraoke({
+    String assetPath = 'assets/audio/diem_xua.wav',
+  }) async {
+    final fileName = assetPath.split('/').last;
     _isBusyProcessing = true;
-    _statusMessage = 'Đang tạo bản thu Karaoke mẫu (Giọng + Nhạc loa ngoài)...';
+    _statusMessage = 'Đang nạp bản thu mẫu "$fileName"...';
     notifyListeners();
 
     try {
       await _player.stop();
-      final pcm = _audioIo.generateDemoKaraokeMix(durationSeconds: 8.0);
+      PcmAudioData pcm;
+      try {
+        final byteData = await rootBundle.load(assetPath);
+        final wavBytes = byteData.buffer.asUint8List(
+          byteData.offsetInBytes,
+          byteData.lengthInBytes,
+        );
+        pcm = _audioIo.decodeWavBytes(wavBytes);
+        _currentTrackName =
+            '$fileName (${pcm.durationSeconds.toStringAsFixed(1)}s)';
+      } catch (_) {
+        pcm = _audioIo.generateDemoKaraokeMix(durationSeconds: 8.0);
+        _currentTrackName = 'Karaoke Mẫu (Giọng + Nhạc Loa Ngoài)';
+      }
+
       _originalPcm = pcm;
-      _currentTrackName = 'Karaoke Mẫu (Giọng + Nhạc Loa Ngoài)';
       _originalWaveform = pcm.extractWaveformPeaks(64);
       _totalDuration = Duration(
         milliseconds: (pcm.durationSeconds * 1000).round(),
@@ -269,9 +443,16 @@ class AppController extends ChangeNotifier {
 
       try {
         final dir = await getTemporaryDirectory();
+        if (_originalFilePath != null) {
+          final oldOrig = File(_originalFilePath!);
+          if (await oldOrig.exists()) {
+            await oldOrig.delete();
+          }
+        }
+        final ts = DateTime.now().millisecondsSinceEpoch;
         final origFile = await _audioIo.writeWavFile(
           pcm,
-          '${dir.path}/karaoke_original.wav',
+          '${dir.path}/karaoke_original_$ts.wav',
         );
         _originalFilePath = origFile.path;
       } catch (_) {}
@@ -457,32 +638,77 @@ class AppController extends ChangeNotifier {
     _enhancedPcm = report.outputAudio;
     _lastReport = report;
     _enhancedWaveform = _enhancedPcm!.extractWaveformPeaks(64);
+    _vocalSoloWaveform = report.vocalOnlyAudio.extractWaveformPeaks(64);
+    _musicSoloWaveform = report.musicOnlyAudio.extractWaveformPeaks(64);
 
     try {
       final dir = await getTemporaryDirectory();
+      // Xóa các file cũ nếu có và dùng tên file kèm timestamp để tránh AudioPlayer trên Android đọc cache cũ
+      for (final oldPath in [
+        _enhancedFilePath,
+        _vocalSoloFilePath,
+        _musicSoloFilePath,
+      ]) {
+        if (oldPath != null) {
+          final oldFile = File(oldPath);
+          if (await oldFile.exists()) {
+            await oldFile.delete();
+          }
+        }
+      }
+      final ts = DateTime.now().millisecondsSinceEpoch;
       final outFile = await _audioIo.writeWavFile(
         _enhancedPcm!,
-        '${dir.path}/karaoke_enhanced.wav',
+        '${dir.path}/karaoke_enhanced_$ts.wav',
+      );
+      final vocalFile = await _audioIo.writeWavFile(
+        report.vocalOnlyAudio,
+        '${dir.path}/karaoke_vocal_solo_$ts.wav',
+      );
+      final musicFile = await _audioIo.writeWavFile(
+        report.musicOnlyAudio,
+        '${dir.path}/karaoke_music_solo_$ts.wav',
       );
       _enhancedFilePath = outFile.path;
+      _vocalSoloFilePath = vocalFile.path;
+      _musicSoloFilePath = musicFile.path;
     } catch (_) {}
 
     _isBusyProcessing = false;
+    final shiftTxt = report.appliedSemitoneShift.abs() >= 0.35
+        ? 'Dịch quãng giọng ${report.appliedSemitoneShift >= 0 ? "+" : ""}${report.appliedSemitoneShift.toStringAsFixed(1)} bán cung (từ ${report.trackOriginalF0Hz.round()}Hz -> F0 giọng lưu ${_voiceProfile.speakingF0MeanHz.round()}Hz)'
+        : 'Khớp màu giọng "${_voiceProfile.name}" (F0 ${_voiceProfile.speakingF0MeanHz.round()}Hz)';
     _statusMessage =
-        'Hoàn tất trong ${report.processingTimeMs}ms • Đã chỉnh ${report.pitchCorrectedFrames} khung Pitch • Peak ${report.peakOutputDb.toStringAsFixed(1)} dBFS';
+        '$shiftTxt • Xử lý ${report.processingTimeMs}ms • Chỉnh ${report.pitchCorrectedFrames} khung Pitch';
     notifyListeners();
 
-    // Nếu đang phát nhạc thì cập nhật nguồn phát sang bản mới
-    if (_isPlaying && _isListeningEnhanced && _enhancedFilePath != null) {
+    // Nếu đang phát nhạc thì cập nhật nguồn phát sang bản mới tương ứng chế độ đang nghe
+    final activePath = _filePathForMode(_listenMode);
+    if (_isPlaying &&
+        _listenMode != AudioListenMode.original &&
+        activePath != null) {
       final pos = _currentPosition;
-      await _player.play(DeviceFileSource(_enhancedFilePath!));
+      await _player.play(DeviceFileSource(activePath));
       await _player.seek(pos);
     }
   }
 
   // ===========================================================================
-  // PHÂN HỆ 3: TRÌNH PHÁT ĐỐI CHIẾU A/B (NGHE GỐC vs ĐÃ LÀM ĐẸP)
+  // PHÂN HỆ 3: TRÌNH PHÁT ĐỐI CHIẾU A/B & KIỂM TRA TÁCH GIỌNG (SOLO STEMS)
   // ===========================================================================
+
+  String? _filePathForMode(AudioListenMode mode) {
+    switch (mode) {
+      case AudioListenMode.original:
+        return _originalFilePath;
+      case AudioListenMode.enhancedMix:
+        return _enhancedFilePath;
+      case AudioListenMode.vocalSolo:
+        return _vocalSoloFilePath ?? _enhancedFilePath;
+      case AudioListenMode.musicSolo:
+        return _musicSoloFilePath ?? _originalFilePath;
+    }
+  }
 
   Future<void> togglePlayPause() async {
     if (_isPlaying) {
@@ -490,8 +716,7 @@ class AppController extends ChangeNotifier {
       return;
     }
 
-    final targetPath =
-        _isListeningEnhanced ? _enhancedFilePath : _originalFilePath;
+    final targetPath = _filePathForMode(_listenMode);
     if (targetPath == null || !await File(targetPath).exists()) {
       _statusMessage = 'Chưa có file âm thanh để phát.';
       notifyListeners();
@@ -501,21 +726,31 @@ class AppController extends ChangeNotifier {
     await _player.play(DeviceFileSource(targetPath));
   }
 
-  /// Chuyển đổi tức thì giữa Nghe Bản Gốc (Before) và Bản Đã Chỉnh Hay Hơn (After)
-  Future<void> setAbComparisonMode(bool listenEnhanced) async {
-    if (_isListeningEnhanced == listenEnhanced) return;
-    _isListeningEnhanced = listenEnhanced;
+  /// Chuyển đổi tức thì giữa 4 chế độ nghe:
+  /// 1. Gốc (Before)
+  /// 2. Đã chỉnh (After Mix)
+  /// 3. Chỉ Giọng (Vocal Solo - kiểm tra độ sạch tách giọng)
+  /// 4. Chỉ Nhạc (Music Solo - kiểm tra nhạc nền tách ra)
+  Future<void> setListenMode(AudioListenMode mode) async {
+    if (_listenMode == mode) return;
+    _listenMode = mode;
     notifyListeners();
 
     if (_isPlaying) {
       final pos = _currentPosition;
-      final targetPath =
-          _isListeningEnhanced ? _enhancedFilePath : _originalFilePath;
+      final targetPath = _filePathForMode(_listenMode);
       if (targetPath != null && await File(targetPath).exists()) {
         await _player.play(DeviceFileSource(targetPath));
         await _player.seek(pos);
       }
     }
+  }
+
+  /// Tương thích với bộ gọi bật/tắt Before/After
+  Future<void> setAbComparisonMode(bool listenEnhanced) async {
+    await setListenMode(
+      listenEnhanced ? AudioListenMode.enhancedMix : AudioListenMode.original,
+    );
   }
 
   Future<void> seekTo(Duration position) async {

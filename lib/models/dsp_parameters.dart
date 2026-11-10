@@ -9,6 +9,12 @@ class DspParameters {
   final double musicGainDb; // Độ lớn nhạc nền từ loa (-12dB -> +4dB)
   final double stereoWidth; // Độ rộng không gian stereo (0.5 -> 1.5)
 
+  // 0.5. Chuyển đổi Đặc trưng Giọng & Quãng Giọng (Voice Timbre & Pitch Adaptation)
+  final bool enableVoiceConversion;
+  final double targetProfileF0Hz; // Tần số F0 đặc trưng của giọng đã lưu (Hz)
+  final double targetProfileCentroidHz; // Trọng tâm âm sắc của giọng đã lưu (Hz)
+  final double voiceConversionStrength; // Mức độ ép màu giọng & cao độ về giọng đã lưu (0.0 -> 1.0)
+
   // 1. Khử tạp âm & De-esser (Giảm tiếng xì/chói)
   final bool enableNoiseGateAndDeEsser;
   final double noiseGateThresholdDb; // (-65dB -> -30dB)
@@ -51,6 +57,10 @@ class DspParameters {
     this.vocalGainDb = 3.0,
     this.musicGainDb = -1.5,
     this.stereoWidth = 1.15,
+    this.enableVoiceConversion = true,
+    this.targetProfileF0Hz = 155.0,
+    this.targetProfileCentroidHz = 1850.0,
+    this.voiceConversionStrength = 0.85,
     this.enableNoiseGateAndDeEsser = true,
     this.noiseGateThresholdDb = -46.0,
     this.deEsserFrequencyHz = 6400.0,
@@ -79,24 +89,39 @@ class DspParameters {
   });
 
   /// Tự động nội suy bộ tham số DSP tối ưu từ Hồ sơ Giọng của người dùng (1-Touch Auto)
+  /// Mỗi đặc trưng giọng (F0, Centroid, Dynamic, Jitter, Sibilance) sẽ định hình màu âm riêng biệt
   factory DspParameters.fromVoiceProfile(UserVoiceProfile profile) {
     final gains = profile.eqCompensationGainsDb;
-    final pitchNeed = (profile.pitchJitterPercent / 4.5).clamp(0.25, 0.88);
-    final deEssNeed = (profile.sibilanceRatio * 1.4).clamp(0.2, 0.85);
-    final compRatio = (2.2 + (profile.dynamicStabilityDb / 2.5)).clamp(2.0, 5.5);
+    final pitchNeed = (profile.pitchJitterPercent / 4.2).clamp(0.22, 0.90);
+    final deEssNeed = (profile.sibilanceRatio * 1.45).clamp(0.18, 0.85);
+    final compRatio = (2.0 + (profile.dynamicStabilityDb / 2.2)).clamp(1.8, 5.5);
+
+    // Cá nhân hóa không gian vang & độ dày theo quãng giọng (F0) và độ sáng (Centroid)
+    final bool isDeepVoice = profile.speakingF0MeanHz < 165.0;
+    final double roomByVoice = isDeepVoice
+        ? 0.54 // Giọng trầm cần phòng gọn hơn để không bị ù
+        : 0.68; // Giọng cao/thanh hợp với đuôi vang rộng hơn
+    final double wetBySmoothness =
+        (0.16 + (1.0 - profile.warmthScore) * 0.10).clamp(0.15, 0.25);
+    final double delayMixByPower =
+        (0.08 + (1.0 - profile.powerScore) * 0.08).clamp(0.07, 0.15);
 
     return DspParameters(
       enableStemSeparation: true,
-      vocalGainDb: 3.2,
-      musicGainDb: -1.8,
-      stereoWidth: 1.2,
+      vocalGainDb: (2.6 + (1.0 - profile.powerScore) * 1.8).clamp(2.2, 4.5),
+      musicGainDb: -1.6,
+      stereoWidth: isDeepVoice ? 1.12 : 1.24,
+      enableVoiceConversion: true,
+      targetProfileF0Hz: profile.speakingF0MeanHz.clamp(85.0, 400.0),
+      targetProfileCentroidHz: profile.spectralCentroidHz.clamp(950.0, 3600.0),
+      voiceConversionStrength: 0.88,
       enableNoiseGateAndDeEsser: true,
       noiseGateThresholdDb: (profile.noiseFloorDb + 4.0).clamp(-60.0, -32.0),
       deEsserFrequencyHz: profile.sibilancePeakHz.clamp(5000.0, 8200.0),
       deEsserAmount: deEssNeed,
       enablePitchCorrection: true,
       pitchCorrectionStrength: pitchNeed,
-      retuneSpeed: (pitchNeed * 0.85).clamp(0.3, 0.8),
+      retuneSpeed: (pitchNeed * 0.85).clamp(0.3, 0.82),
       enableEq: true,
       eqSub100HzDb: gains[0],
       eqLowMid280HzDb: gains[1],
@@ -104,21 +129,21 @@ class DspParameters {
       eqHighMid3500HzDb: gains[3],
       eqAir10kHzDb: gains[4],
       enableCompressor: true,
-      compThresholdDb: -21.0,
+      compThresholdDb: -20.5,
       compRatio: compRatio,
-      compMakeupGainDb: 3.5,
+      compMakeupGainDb: (2.8 + (1.0 - profile.powerScore) * 1.5).clamp(2.5, 4.5),
       enableReverbDelay: true,
-      reverbRoomSize: 0.74,
-      reverbDamping: 0.42,
-      reverbWetMix: 0.27,
-      delayTimeMs: 190.0,
-      delayFeedback: 0.24,
-      delayMix: 0.15,
+      reverbRoomSize: roomByVoice,
+      reverbDamping: isDeepVoice ? 0.52 : 0.40,
+      reverbWetMix: wetBySmoothness,
+      delayTimeMs: isDeepVoice ? 165.0 : 195.0,
+      delayFeedback: 0.18,
+      delayMix: delayMixByPower,
       masterIntensity: 1.0,
     );
   }
 
-  /// Tạo bộ tham số theo Preset + kết hợp với đặc trưng giọng của người dùng
+  /// Tạo bộ tham số theo Preset + kết hợp chặt chẽ với đặc trưng Hồ sơ giọng của người dùng
   factory DspParameters.fromPreset(
     KaraokePresetStyle preset,
     UserVoiceProfile profile, {
@@ -126,7 +151,7 @@ class DspParameters {
     double vocalMusicBalance = 0.0, // -1.0 (nhiều nhạc) -> +1.0 (nhiều giọng)
   }) {
     final base = DspParameters.fromVoiceProfile(profile);
-    final vocalBoost = 3.0 + vocalMusicBalance * 3.5;
+    final vocalBoost = base.vocalGainDb + vocalMusicBalance * 3.5;
     final musicAtten = -1.5 - vocalMusicBalance * 3.0;
 
     switch (preset) {
@@ -139,82 +164,83 @@ class DspParameters {
       case KaraokePresetStyle.studioPop:
         return base.copyWith(
           masterIntensity: intensity,
-          vocalGainDb: vocalBoost + 0.5,
+          vocalGainDb: vocalBoost + 0.4,
           musicGainDb: musicAtten,
-          pitchCorrectionStrength: 0.72,
+          pitchCorrectionStrength: (base.pitchCorrectionStrength + 0.15).clamp(0.35, 0.92),
           retuneSpeed: 0.68,
-          eqSub100HzDb: -3.5,
-          eqLowMid280HzDb: base.eqLowMid280HzDb * 0.8 + 1.2,
-          eqHighMid3500HzDb: 3.8,
-          eqAir10kHzDb: 3.5,
-          compThresholdDb: -23.0,
-          compRatio: 4.0,
-          compMakeupGainDb: 4.2,
-          reverbRoomSize: 0.65,
-          reverbWetMix: 0.22,
-          delayTimeMs: 160.0,
-          delayMix: 0.12,
+          eqSub100HzDb: base.eqSub100HzDb - 0.5,
+          eqLowMid280HzDb: base.eqLowMid280HzDb + 0.5,
+          eqMid1200HzDb: base.eqMid1200HzDb,
+          eqHighMid3500HzDb: base.eqHighMid3500HzDb + 1.0,
+          eqAir10kHzDb: base.eqAir10kHzDb + 1.2,
+          compThresholdDb: -22.0,
+          compRatio: (base.compRatio + 0.6).clamp(2.5, 5.5),
+          compMakeupGainDb: base.compMakeupGainDb + 0.5,
+          reverbRoomSize: 0.55,
+          reverbWetMix: 0.16,
+          delayTimeMs: 155.0,
+          delayMix: 0.09,
         );
       case KaraokePresetStyle.boleroSweet:
         return base.copyWith(
           masterIntensity: intensity,
-          vocalGainDb: vocalBoost + 1.0,
+          vocalGainDb: vocalBoost + 0.8,
           musicGainDb: musicAtten - 0.5,
-          pitchCorrectionStrength: 0.50,
-          retuneSpeed: 0.42,
-          eqSub100HzDb: -2.0,
-          eqLowMid280HzDb: 3.2,
-          eqMid1200HzDb: 0.5,
-          eqHighMid3500HzDb: 2.6,
-          eqAir10kHzDb: 2.2,
+          pitchCorrectionStrength: base.pitchCorrectionStrength,
+          retuneSpeed: 0.45,
+          eqSub100HzDb: base.eqSub100HzDb + 0.5,
+          eqLowMid280HzDb: base.eqLowMid280HzDb + 1.8,
+          eqMid1200HzDb: base.eqMid1200HzDb + 0.6,
+          eqHighMid3500HzDb: base.eqHighMid3500HzDb,
+          eqAir10kHzDb: base.eqAir10kHzDb,
           compThresholdDb: -19.0,
-          compRatio: 2.8,
-          reverbRoomSize: 0.86,
-          reverbDamping: 0.35,
-          reverbWetMix: 0.38,
-          delayTimeMs: 245.0,
-          delayFeedback: 0.36,
-          delayMix: 0.26,
+          compRatio: base.compRatio,
+          reverbRoomSize: 0.76,
+          reverbDamping: 0.38,
+          reverbWetMix: 0.28,
+          delayTimeMs: 225.0,
+          delayFeedback: 0.26,
+          delayMix: 0.18,
         );
       case KaraokePresetStyle.acousticNatural:
         return base.copyWith(
           masterIntensity: intensity,
           vocalGainDb: vocalBoost,
           musicGainDb: musicAtten + 0.5,
-          pitchCorrectionStrength: 0.32,
+          pitchCorrectionStrength: (base.pitchCorrectionStrength * 0.65).clamp(0.15, 0.55),
           retuneSpeed: 0.30,
-          eqSub100HzDb: -2.5,
-          eqLowMid280HzDb: 1.4,
-          eqMid1200HzDb: -0.5,
-          eqHighMid3500HzDb: 2.0,
-          eqAir10kHzDb: 2.5,
+          eqSub100HzDb: base.eqSub100HzDb,
+          eqLowMid280HzDb: base.eqLowMid280HzDb * 0.85,
+          eqMid1200HzDb: base.eqMid1200HzDb,
+          eqHighMid3500HzDb: base.eqHighMid3500HzDb * 0.85,
+          eqAir10kHzDb: base.eqAir10kHzDb * 0.9,
           compThresholdDb: -18.0,
-          compRatio: 2.2,
+          compRatio: 2.1,
           compMakeupGainDb: 2.2,
-          reverbRoomSize: 0.52,
+          reverbRoomSize: 0.46,
           reverbDamping: 0.55,
-          reverbWetMix: 0.18,
-          delayMix: 0.08,
+          reverbWetMix: 0.13,
+          delayMix: 0.06,
         );
       case KaraokePresetStyle.liveStage:
         return base.copyWith(
           masterIntensity: intensity,
-          vocalGainDb: vocalBoost + 1.5,
+          vocalGainDb: vocalBoost + 1.2,
           musicGainDb: musicAtten - 1.0,
-          pitchCorrectionStrength: 0.82,
+          pitchCorrectionStrength: (base.pitchCorrectionStrength + 0.22).clamp(0.5, 0.95),
           retuneSpeed: 0.78,
-          eqSub100HzDb: -4.0,
-          eqLowMid280HzDb: 2.2,
-          eqHighMid3500HzDb: 4.5,
-          eqAir10kHzDb: 3.8,
-          compThresholdDb: -24.0,
-          compRatio: 4.8,
-          compMakeupGainDb: 4.8,
-          reverbRoomSize: 0.82,
-          reverbWetMix: 0.32,
-          delayTimeMs: 210.0,
-          delayFeedback: 0.30,
-          delayMix: 0.22,
+          eqSub100HzDb: base.eqSub100HzDb - 1.0,
+          eqLowMid280HzDb: base.eqLowMid280HzDb + 0.8,
+          eqHighMid3500HzDb: base.eqHighMid3500HzDb + 1.6,
+          eqAir10kHzDb: base.eqAir10kHzDb + 1.4,
+          compThresholdDb: -23.0,
+          compRatio: 4.5,
+          compMakeupGainDb: 4.2,
+          reverbRoomSize: 0.72,
+          reverbWetMix: 0.24,
+          delayTimeMs: 200.0,
+          delayFeedback: 0.22,
+          delayMix: 0.15,
         );
     }
   }
@@ -224,6 +250,10 @@ class DspParameters {
     double? vocalGainDb,
     double? musicGainDb,
     double? stereoWidth,
+    bool? enableVoiceConversion,
+    double? targetProfileF0Hz,
+    double? targetProfileCentroidHz,
+    double? voiceConversionStrength,
     bool? enableNoiseGateAndDeEsser,
     double? noiseGateThresholdDb,
     double? deEsserFrequencyHz,
@@ -255,6 +285,13 @@ class DspParameters {
       vocalGainDb: vocalGainDb ?? this.vocalGainDb,
       musicGainDb: musicGainDb ?? this.musicGainDb,
       stereoWidth: stereoWidth ?? this.stereoWidth,
+      enableVoiceConversion:
+          enableVoiceConversion ?? this.enableVoiceConversion,
+      targetProfileF0Hz: targetProfileF0Hz ?? this.targetProfileF0Hz,
+      targetProfileCentroidHz:
+          targetProfileCentroidHz ?? this.targetProfileCentroidHz,
+      voiceConversionStrength:
+          voiceConversionStrength ?? this.voiceConversionStrength,
       enableNoiseGateAndDeEsser:
           enableNoiseGateAndDeEsser ?? this.enableNoiseGateAndDeEsser,
       noiseGateThresholdDb: noiseGateThresholdDb ?? this.noiseGateThresholdDb,

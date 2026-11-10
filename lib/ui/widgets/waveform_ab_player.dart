@@ -11,10 +11,39 @@ class WaveformAbPlayer extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final bool isEnhanced = controller.isListeningEnhanced;
-    final peaks = isEnhanced
-        ? controller.enhancedWaveform
-        : controller.originalWaveform;
+    final AudioListenMode mode = controller.listenMode;
+    final bool isEnhanced = mode != AudioListenMode.original;
+    final List<double> peaks;
+    final Color activeColor;
+    final String modeBadgeText;
+    final IconData modeIcon;
+
+    switch (mode) {
+      case AudioListenMode.original:
+        peaks = controller.originalWaveform;
+        activeColor = AppTheme.accentAmber;
+        modeBadgeText = 'Đang nghe: Bản thu thô (Chưa tách)';
+        modeIcon = Icons.mic_none;
+        break;
+      case AudioListenMode.enhancedMix:
+        peaks = controller.enhancedWaveform;
+        activeColor = AppTheme.accentCyan;
+        modeBadgeText = 'Đã tách STFT • Khớp Giọng + Nhạc';
+        modeIcon = Icons.auto_awesome;
+        break;
+      case AudioListenMode.vocalSolo:
+        peaks = controller.vocalSoloWaveform;
+        activeColor = AppTheme.accentEmerald;
+        modeBadgeText = 'SOLO GIỌNG: Chỉ nghe Vocal đã tách & chỉnh';
+        modeIcon = Icons.record_voice_over;
+        break;
+      case AudioListenMode.musicSolo:
+        peaks = controller.musicSoloWaveform;
+        activeColor = AppTheme.primaryNeon;
+        modeBadgeText = 'SOLO NHẠC: Chỉ nghe Nhạc nền đã tách';
+        modeIcon = Icons.music_note;
+        break;
+    }
 
     final int totalMs = controller.totalDuration.inMilliseconds;
     final int currentMs =
@@ -28,14 +57,14 @@ class WaveformAbPlayer extends StatelessWidget {
         borderRadius: BorderRadius.circular(18),
         border: Border.all(
           color: isEnhanced
-              ? AppTheme.accentCyan.withValues(alpha: 0.45)
+              ? activeColor.withValues(alpha: 0.45)
               : Colors.white.withValues(alpha: 0.12),
           width: 1.4,
         ),
         boxShadow: [
           if (isEnhanced)
             BoxShadow(
-              color: AppTheme.accentCyan.withValues(alpha: 0.08),
+              color: activeColor.withValues(alpha: 0.08),
               blurRadius: 18,
               spreadRadius: 1,
             ),
@@ -44,12 +73,12 @@ class WaveformAbPlayer extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Hàng tiêu đề bài + Nút chuyển đổi Before / After
+          // Hàng tiêu đề bài
           Row(
             children: [
               Icon(
-                isEnhanced ? Icons.auto_awesome : Icons.mic_none,
-                color: isEnhanced ? AppTheme.accentCyan : AppTheme.accentAmber,
+                modeIcon,
+                color: activeColor,
                 size: 20,
               ),
               const SizedBox(width: 8),
@@ -65,10 +94,12 @@ class WaveformAbPlayer extends StatelessWidget {
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
-              const SizedBox(width: 8),
-              _buildAbSwitch(context, isEnhanced),
             ],
           ),
+          const SizedBox(height: 10),
+
+          // Hàng 4 chế độ nghe kiểm tra: Gốc | Đã chỉnh | Chỉ Giọng (Test tách) | Chỉ Nhạc
+          _build4WayModeSelector(mode),
           const SizedBox(height: 14),
 
           // Sóng âm tương tác (Chạm để tua)
@@ -90,8 +121,7 @@ class WaveformAbPlayer extends StatelessWidget {
                 painter: _WaveformBarsPainter(
                   peaks: peaks,
                   progress: progress,
-                  activeColor:
-                      isEnhanced ? AppTheme.accentCyan : AppTheme.accentAmber,
+                  activeColor: activeColor,
                 ),
               ),
             ),
@@ -132,25 +162,25 @@ class WaveformAbPlayer extends StatelessWidget {
               ),
               const Spacer(),
               if (controller.lastReport != null)
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 10,
-                    vertical: 5,
-                  ),
-                  decoration: BoxDecoration(
-                    color: AppTheme.cardElevated,
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                  child: Text(
-                    isEnhanced
-                        ? 'Đã tách Vocal • +Pitch & Reverb'
-                        : 'Đang nghe: Bản thu thô',
-                    style: TextStyle(
-                      fontSize: 11,
-                      fontWeight: FontWeight.w600,
-                      color: isEnhanced
-                          ? AppTheme.accentEmerald
-                          : AppTheme.accentAmber,
+                Flexible(
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 5,
+                    ),
+                    decoration: BoxDecoration(
+                      color: AppTheme.cardElevated,
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Text(
+                      modeBadgeText,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                        color: activeColor,
+                      ),
                     ),
                   ),
                 ),
@@ -161,28 +191,47 @@ class WaveformAbPlayer extends StatelessWidget {
     );
   }
 
-  Widget _buildAbSwitch(BuildContext context, bool isEnhanced) {
+  Widget _build4WayModeSelector(AudioListenMode currentMode) {
     return Container(
-      padding: const EdgeInsets.all(3),
+      width: double.infinity,
+      padding: const EdgeInsets.all(4),
       decoration: BoxDecoration(
         color: AppTheme.bgDark,
         borderRadius: BorderRadius.circular(12),
         border: Border.all(color: Colors.white.withValues(alpha: 0.1)),
       ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
+      child: Wrap(
+        spacing: 4,
+        runSpacing: 4,
+        alignment: WrapAlignment.spaceBetween,
         children: [
           _abTabButton(
             label: 'Gốc (Before)',
-            selected: !isEnhanced,
+            icon: Icons.history,
+            selected: currentMode == AudioListenMode.original,
             activeColor: AppTheme.accentAmber,
-            onTap: () => controller.setAbComparisonMode(false),
+            onTap: () => controller.setListenMode(AudioListenMode.original),
           ),
           _abTabButton(
-            label: 'Đã chỉnh (After)',
-            selected: isEnhanced,
+            label: 'Đã chỉnh (Mix)',
+            icon: Icons.auto_awesome,
+            selected: currentMode == AudioListenMode.enhancedMix,
             activeColor: AppTheme.accentCyan,
-            onTap: () => controller.setAbComparisonMode(true),
+            onTap: () => controller.setListenMode(AudioListenMode.enhancedMix),
+          ),
+          _abTabButton(
+            label: 'Chỉ Giọng (Test tách)',
+            icon: Icons.record_voice_over,
+            selected: currentMode == AudioListenMode.vocalSolo,
+            activeColor: AppTheme.accentEmerald,
+            onTap: () => controller.setListenMode(AudioListenMode.vocalSolo),
+          ),
+          _abTabButton(
+            label: 'Chỉ Nhạc',
+            icon: Icons.music_note,
+            selected: currentMode == AudioListenMode.musicSolo,
+            activeColor: AppTheme.primaryNeon,
+            onTap: () => controller.setListenMode(AudioListenMode.musicSolo),
           ),
         ],
       ),
@@ -191,6 +240,7 @@ class WaveformAbPlayer extends StatelessWidget {
 
   Widget _abTabButton({
     required String label,
+    required IconData icon,
     required bool selected,
     required Color activeColor,
     required VoidCallback onTap,
@@ -199,7 +249,7 @@ class WaveformAbPlayer extends StatelessWidget {
       onTap: onTap,
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 180),
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
         decoration: BoxDecoration(
           color: selected ? activeColor.withValues(alpha: 0.22) : Colors.transparent,
           borderRadius: BorderRadius.circular(9),
@@ -208,13 +258,24 @@ class WaveformAbPlayer extends StatelessWidget {
             width: 1,
           ),
         ),
-        child: Text(
-          label,
-          style: TextStyle(
-            fontSize: 11.5,
-            fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
-            color: selected ? activeColor : AppTheme.textSecondary,
-          ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              icon,
+              size: 13,
+              color: selected ? activeColor : AppTheme.textSecondary,
+            ),
+            const SizedBox(width: 4),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 11.2,
+                fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                color: selected ? activeColor : AppTheme.textSecondary,
+              ),
+            ),
+          ],
         ),
       ),
     );

@@ -39,6 +39,9 @@ class KaraokeStudioScreen extends StatelessWidget {
   }
 
   Widget _buildSourceInputCard(BuildContext context) {
+    final savedList = controller.savedProfiles;
+    final profile = controller.voiceProfile;
+
     return Container(
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
@@ -49,6 +52,71 @@ class KaraokeStudioScreen extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          if (savedList.isNotEmpty) ...[
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 2),
+              decoration: BoxDecoration(
+                color: AppTheme.bgDark,
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(
+                  color: AppTheme.accentCyan.withValues(alpha: 0.35),
+                ),
+              ),
+              child: Row(
+                children: [
+                  const Icon(
+                    Icons.person_pin_circle_rounded,
+                    color: AppTheme.accentCyan,
+                    size: 18,
+                  ),
+                  const SizedBox(width: 6),
+                  const Text(
+                    'Hồ sơ giọng áp dụng:',
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      color: AppTheme.textSecondary,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: DropdownButtonHideUnderline(
+                      child: DropdownButton<String>(
+                        value: savedList.any((e) => e.id == profile.id)
+                            ? profile.id
+                            : savedList.first.id,
+                        isExpanded: true,
+                        dropdownColor: AppTheme.cardElevated,
+                        style: const TextStyle(
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w700,
+                          color: AppTheme.accentEmerald,
+                        ),
+                        items: savedList.map((item) {
+                          return DropdownMenuItem<String>(
+                            value: item.id,
+                            child: Text(
+                              '${item.name} (${item.vocalType.title.split(' ').first})',
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          );
+                        }).toList(),
+                        onChanged: (selectedId) {
+                          if (selectedId == null) return;
+                          final found = savedList.firstWhere(
+                            (e) => e.id == selectedId,
+                            orElse: () => savedList.first,
+                          );
+                          controller.selectSavedVoiceProfile(found);
+                        },
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+          ],
           const Row(
             children: [
               Icon(Icons.queue_music_rounded, color: AppTheme.accentCyan, size: 19),
@@ -118,7 +186,7 @@ class KaraokeStudioScreen extends StatelessWidget {
                   ),
                   onPressed: controller.isBusyProcessing
                       ? null
-                      : controller.loadBuiltInDemoKaraoke,
+                      : () => _showSamplePickerDialog(context),
                   icon: const Icon(
                     Icons.library_music_outlined,
                     size: 18,
@@ -139,6 +207,92 @@ class KaraokeStudioScreen extends StatelessWidget {
         ],
       ),
     );
+  }
+
+  Future<void> _showSamplePickerDialog(BuildContext context) async {
+    final samples = await controller.listAvailableSampleAssets();
+    if (!context.mounted) return;
+
+    final chosenAsset = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: AppTheme.cardDark,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Row(
+                  children: [
+                    Icon(
+                      Icons.library_music_rounded,
+                      color: AppTheme.accentEmerald,
+                      size: 20,
+                    ),
+                    SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        'Chọn Bản Thu Mẫu (assets/audio)',
+                        style: TextStyle(
+                          fontSize: 15.5,
+                          fontWeight: FontWeight.w800,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                ...samples.map((assetPath) {
+                  final fileName = assetPath.split('/').last;
+                  final isCurrent =
+                      controller.currentTrackName.startsWith(fileName);
+                  return ListTile(
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 8),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    leading: Icon(
+                      isCurrent
+                          ? Icons.play_circle_fill_rounded
+                          : Icons.audio_file_outlined,
+                      color: isCurrent
+                          ? AppTheme.accentEmerald
+                          : AppTheme.accentCyan,
+                    ),
+                    title: Text(
+                      fileName,
+                      style: TextStyle(
+                        fontWeight: FontWeight.w700,
+                        color: isCurrent ? AppTheme.accentEmerald : Colors.white,
+                      ),
+                    ),
+                    subtitle: Text(
+                      assetPath,
+                      style: const TextStyle(
+                        fontSize: 11.5,
+                        color: AppTheme.textSecondary,
+                      ),
+                    ),
+                    trailing: const Icon(Icons.chevron_right_rounded),
+                    onTap: () => Navigator.of(ctx).pop(assetPath),
+                  );
+                }),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+
+    if (chosenAsset != null) {
+      await controller.loadBuiltInDemoKaraoke(assetPath: chosenAsset);
+    }
   }
 
   Widget _buildDspReportBanner(BuildContext context) {

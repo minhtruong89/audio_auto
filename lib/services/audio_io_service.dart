@@ -326,4 +326,56 @@ class AudioIoService {
       rightChannel: right,
     );
   }
+
+  /// Tạo âm thanh mẫu 8 bậc thang âm "Đồ - Rê - Mi - Pha - Son - La - Si - Đố" (C3 -> C4)
+  /// để người dùng bấm nghe mẫu trước khi hát ở Bước 2 (Đo quãng giọng)
+  PcmAudioData generateDoReMiGuideScale({
+    double durationSeconds = 4.0,
+    int sampleRate = 44100,
+  }) {
+    final int numSamples = (durationSeconds * sampleRate).round();
+    final left = Float64List(numSamples);
+    final right = Float64List(numSamples);
+
+    // Tần số 8 nốt Đồ -> Đố (C3 = 130.81Hz lên C4 = 261.63Hz, phù hợp cả nam và nữ bắt tông)
+    const List<double> scaleHz = [
+      130.81, // Đồ
+      146.83, // Rê
+      164.81, // Mi
+      174.61, // Pha
+      196.00, // Son
+      220.00, // La
+      246.94, // Si
+      261.63, // Đố
+    ];
+
+    double phase = 0.0;
+    for (int i = 0; i < numSamples; i++) {
+      final double t = i / sampleRate;
+      final double stepFloat = (t / durationSeconds) * scaleHz.length;
+      final int idx = stepFloat.floor().clamp(0, scaleHz.length - 1);
+      final double noteProgress = stepFloat - idx;
+      final double f0 = scaleHz[idx];
+
+      phase += 2.0 * math.pi * f0 / sampleRate;
+      // Âm sắc tiếng đàn Piano/Bell ấm dịu để làm mẫu bắt tông
+      final double env = math.sin(math.pi * noteProgress.clamp(0.0, 1.0)) *
+          math.exp(-noteProgress * 1.4);
+      final double sample = (0.55 * math.sin(phase) +
+              0.25 * math.sin(2.0 * phase) +
+              0.12 * math.sin(3.0 * phase)) *
+          env *
+          0.55;
+
+      left[i] = sample;
+      right[i] = sample;
+    }
+
+    return PcmAudioData(
+      sampleRate: sampleRate,
+      channels: 2,
+      leftChannel: left,
+      rightChannel: right,
+    );
+  }
 }
