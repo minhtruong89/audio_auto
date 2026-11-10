@@ -1,19 +1,22 @@
-/// 3 chế độ điều khiển trên màn hình Karaoke Studio để người dùng test và so sánh
+/// 3 nhóm tab điều khiển trực quan theo từng thành phần âm thanh:
+/// - Hòa trộn: Cách phối quyện Giọng + Nhạc, Phong cách nhanh, Khớp tông tự động
+/// - Giọng Vocal: Chỉnh sâu 5-Band EQ Vocal, Auto-Tune khóa âm giai, Compressor, De-Esser, Reverb
+/// - Nhạc nền: Chỉnh Tone Beat (±6 bán cung), Độ rộng Stereo và 5-Band EQ riêng cho Nhạc nền
 enum StudioControlMode {
-  oneTouchAuto(
-    '1-Touch Auto',
-    'Tự động 100% theo Hồ sơ giọng',
-    'Chỉ cần 1 nút bấm, AI tự động tách giọng khỏi nhạc loa ngoài và bù trừ EQ, Auto-Tune, Reverb theo đúng đặc trưng giọng đã đo.',
+  mix(
+    'Hòa trộn',
+    'Hòa trộn Giọng & Nhạc nền',
+    'Chọn phong cách nhanh (1-Touch / Presets), cân bằng độ hòa quyện Giọng/Nhạc, dìm nhạc nhường giọng và khớp tông tự động.',
   ),
-  smartPresets(
-    'Smart Presets',
-    'Chọn Phong cách & Thanh kéo Cường độ',
-    'Chọn nhanh phong cách nhạc (Phòng thu, Bolero, Acoustic, Hát Live) kết hợp thanh kéo mức độ can thiệp và cân bằng Giọng/Nhạc.',
+  vocal(
+    'Giọng Vocal',
+    'Tinh chỉnh Giọng Hát (Vocal)',
+    'Can thiệp chi tiết luồng giọng: chuyển màu giọng, Auto-Tune khóa âm giai, 5-Band EQ Vocal, Compressor, De-Esser & Reverb.',
   ),
-  proMixer(
-    'Pro Mixer',
-    'Bàn trộn Kỹ thuật Chuyên sâu',
-    'Can thiệp chi tiết từng hiệu ứng: Tách Stem, 5 cần EQ, Pitch Correction (Auto-Tune), Compressor, De-esser và Không gian Reverb/Delay.',
+  music(
+    'Nhạc nền',
+    'Tinh chỉnh Nhạc Nền (Beat)',
+    'Thay đổi Tone nhạc nền (±6 bán cung), độ rộng không gian Stereo và 5-Band EQ riêng cho luồng nhạc nền.',
   );
 
   final String shortTitle;

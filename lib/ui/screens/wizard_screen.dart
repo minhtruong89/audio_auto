@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../../models/voice_profile.dart';
 import '../../state/app_controller.dart';
 import '../theme/app_theme.dart';
 import '../widgets/radar_profile_chart.dart';
@@ -66,7 +67,7 @@ class _VoiceProfilingWizardScreenState
       title: 'Bước 4: Đo Âm Xì (Sibilance) & Đường Cong Bù 5-Band EQ',
       subtitle: 'Hát hoặc đọc rõ câu có nhiều phụ âm s, x, ch, t để đo tần số chói mic',
       promptText:
-          '"Sóng xô bờ cát sáng, tiếng chim ca vang khắp chốn xa xôi..."',
+          '"Mưa vẫn mưa bay trên tầng tháp cổ..."',
       targetFeature: 'Trích xuất: Đỉnh Sibilance (5kHz-8kHz) cho De-esser & Đường cong bù 5-Band EQ',
     ),
   ];
@@ -459,86 +460,162 @@ class _VoiceProfilingWizardScreenState
     final previewProfile = await ctrl.analyze4StepsForPreview();
     if (!mounted) return;
 
+    UserVoiceProfile editedProfile = previewProfile;
     final nameController = TextEditingController(text: previewProfile.name);
     final savedName = await showDialog<String>(
       context: context,
       barrierDismissible: false,
       builder: (ctx) {
-        return AlertDialog(
-          backgroundColor: AppTheme.cardDark,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(18),
-            side: BorderSide(color: AppTheme.accentCyan.withValues(alpha: 0.4)),
-          ),
-          title: const Row(
-            children: [
-              Icon(Icons.save_alt_rounded, color: AppTheme.accentCyan, size: 22),
-              SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  'Lưu Hồ Sơ Giọng Của Bạn',
-                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+        return StatefulBuilder(
+          builder: (ctx, setDialogState) {
+            final bool isMale = editedProfile.isMaleVoice;
+            return AlertDialog(
+              backgroundColor: AppTheme.cardDark,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(18),
+                side: BorderSide(
+                  color: AppTheme.accentCyan.withValues(alpha: 0.4),
                 ),
               ),
-            ],
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                'Phân loại: ${previewProfile.vocalType.title} (${previewProfile.minPitchHz.round()}–${previewProfile.maxPitchHz.round()}Hz)',
-                style: const TextStyle(
-                  fontSize: 12.5,
-                  color: AppTheme.accentEmerald,
-                  fontWeight: FontWeight.w700,
+              title: const Row(
+                children: [
+                  Icon(Icons.save_alt_rounded, color: AppTheme.accentCyan, size: 22),
+                  SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'Lưu Hồ Sơ Giọng Của Bạn',
+                      style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+                    ),
+                  ),
+                ],
+              ),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Phân loại: ${editedProfile.vocalType.title}',
+                    style: const TextStyle(
+                      fontSize: 12.5,
+                      color: AppTheme.accentEmerald,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    'Tần số nói (F0): ${editedProfile.speakingF0MeanHz.round()}Hz • Quãng đo: ${editedProfile.minPitchHz.round()}–${editedProfile.maxPitchHz.round()}Hz',
+                    style: const TextStyle(
+                      fontSize: 11.5,
+                      color: AppTheme.textSecondary,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      const Text(
+                        'Giới tính giọng:',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: AppTheme.textSecondary,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      ChoiceChip(
+                        label: const Text('Nam', style: TextStyle(fontSize: 12)),
+                        selected: isMale,
+                        selectedColor: AppTheme.accentCyan.withValues(alpha: 0.25),
+                        onSelected: (_) {
+                          setDialogState(() {
+                            final double fixedF0 =
+                                editedProfile.speakingF0MeanHz > 175.0
+                                    ? (editedProfile.speakingF0MeanHz / 2.0)
+                                        .clamp(105.0, 155.0)
+                                    : editedProfile.speakingF0MeanHz;
+                            editedProfile = editedProfile.copyWith(
+                              speakingF0MeanHz: fixedF0,
+                              vocalType: fixedF0 < 115.0
+                                  ? VocalRangeType.bass
+                                  : VocalRangeType.baritone,
+                            );
+                            if (nameController.text.contains('(Nữ)')) {
+                              nameController.text =
+                                  nameController.text.replaceAll('(Nữ)', '(Nam)');
+                            }
+                          });
+                        },
+                      ),
+                      const SizedBox(width: 6),
+                      ChoiceChip(
+                        label: const Text('Nữ', style: TextStyle(fontSize: 12)),
+                        selected: !isMale,
+                        selectedColor: AppTheme.primaryNeon.withValues(alpha: 0.28),
+                        onSelected: (_) {
+                          setDialogState(() {
+                            final double fixedF0 =
+                                editedProfile.speakingF0MeanHz < 175.0
+                                    ? (editedProfile.speakingF0MeanHz * 1.65)
+                                        .clamp(195.0, 260.0)
+                                    : editedProfile.speakingF0MeanHz;
+                            editedProfile = editedProfile.copyWith(
+                              speakingF0MeanHz: fixedF0,
+                              vocalType: VocalRangeType.mezzoSoprano,
+                            );
+                            if (nameController.text.contains('(Nam)')) {
+                              nameController.text =
+                                  nameController.text.replaceAll('(Nam)', '(Nữ)');
+                            }
+                          });
+                        },
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  const Text(
+                    'Nhập tên gợi nhớ cho giọng này (để chọn lại nhanh những lần mở app sau):',
+                    style: TextStyle(fontSize: 12.5, color: AppTheme.textSecondary),
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: nameController,
+                    autofocus: true,
+                    style: const TextStyle(color: Colors.white, fontSize: 14),
+                    decoration: InputDecoration(
+                      hintText: 'VD: Giọng Nam Phòng Khách, Giọng Hát Bolero...',
+                      filled: true,
+                      fillColor: AppTheme.bgDark,
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(ctx).pop(null),
+                  child: const Text('Hủy'),
                 ),
-              ),
-              const SizedBox(height: 12),
-              const Text(
-                'Nhập tên gợi nhớ cho giọng này (để chọn lại nhanh những lần mở app sau):',
-                style: TextStyle(fontSize: 12.5, color: AppTheme.textSecondary),
-              ),
-              const SizedBox(height: 10),
-              TextField(
-                controller: nameController,
-                autofocus: true,
-                style: const TextStyle(color: Colors.white, fontSize: 14),
-                decoration: InputDecoration(
-                  hintText: 'VD: Giọng Nam Phòng Khách, Giọng Hát Bolero...',
-                  filled: true,
-                  fillColor: AppTheme.bgDark,
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(12),
+                FilledButton.icon(
+                  style: FilledButton.styleFrom(
+                    backgroundColor: AppTheme.accentEmerald,
+                    foregroundColor: Colors.black,
+                  ),
+                  onPressed: () => Navigator.of(ctx).pop(nameController.text),
+                  icon: const Icon(Icons.check_rounded, size: 18),
+                  label: const Text(
+                    'Lưu Giọng',
+                    style: TextStyle(fontWeight: FontWeight.w800),
                   ),
                 ),
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(ctx).pop(null),
-              child: const Text('Hủy'),
-            ),
-            FilledButton.icon(
-              style: FilledButton.styleFrom(
-                backgroundColor: AppTheme.accentEmerald,
-                foregroundColor: Colors.black,
-              ),
-              onPressed: () => Navigator.of(ctx).pop(nameController.text),
-              icon: const Icon(Icons.check_rounded, size: 18),
-              label: const Text(
-                'Lưu Giọng',
-                style: TextStyle(fontWeight: FontWeight.w800),
-              ),
-            ),
-          ],
+              ],
+            );
+          },
         );
       },
     );
 
     if (savedName != null && mounted) {
-      await ctrl.saveAnalyzedVoiceProfile(previewProfile, savedName);
+      await ctrl.saveAnalyzedVoiceProfile(editedProfile, savedName);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -611,7 +688,7 @@ class _VoiceProfilingWizardScreenState
                           return DropdownMenuItem<String>(
                             value: item.id,
                             child: Text(
-                              '${item.name} (${item.vocalType.title.split(' ').first})',
+                              item.displayLabelWithType,
                               overflow: TextOverflow.ellipsis,
                             ),
                           );

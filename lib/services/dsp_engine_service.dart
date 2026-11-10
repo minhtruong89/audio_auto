@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import '../models/dsp_parameters.dart';
 import 'audio_io_service.dart';
+import 'music_key_analyzer_service.dart';
 import 'vocal_separator_service.dart';
 import 'voice_analyzer_service.dart';
 
@@ -18,6 +19,8 @@ class DspProcessingReport {
   final double trackOriginalF0Hz;
   final double appliedSemitoneShift;
   final bool usedAiOnnxModel;
+  final DetectedMusicKey? detectedMusicKey;
+  final int appliedAutoKeyShiftSemitones;
 
   const DspProcessingReport({
     required this.outputAudio,
@@ -30,6 +33,8 @@ class DspProcessingReport {
     this.trackOriginalF0Hz = 180.0,
     this.appliedSemitoneShift = 0.0,
     this.usedAiOnnxModel = false,
+    this.detectedMusicKey,
+    this.appliedAutoKeyShiftSemitones = 0,
   });
 }
 
@@ -37,6 +42,7 @@ class DspProcessingReport {
 class DspEngineService {
   final VocalSeparatorService _separator = VocalSeparatorService();
   final VoiceAnalyzerService _analyzer = VoiceAnalyzerService();
+  final MusicKeyAnalyzerService _keyAnalyzer = MusicKeyAnalyzerService();
 
   bool get isAiOnnxReady => _separator.isAiOnnxReady;
 
@@ -99,15 +105,47 @@ class DspEngineService {
     Float64List vLeft = Float64List.fromList(vocalStem.leftChannel);
     Float64List vRight = Float64List.fromList(vocalStem.rightChannel);
 
+    // Bước 0.5: Tự động nhận diện Tông Nhạc (Chromagram) & Độ lệch tông giữa Vocal vs Music
+    final DetectedMusicKey? detectedKey = params.enableStemSeparation
+        ? _keyAnalyzer.analyzeKeys(
+            musicStem: musicStem,
+            vocalStem: vocalStem,
+          )
+        : null;
+
     // Bước 1: Khử tạp âm nền (Smooth Noise Gate) & Giảm âm xì chói (Dynamic De-esser)
     if (params.enableNoiseGateAndDeEsser && intensity > 0.01) {
       _applyNoiseGateAndDeEsser(vLeft, vRight, sr, params, intensity);
     }
 
-    // Bước 1.5: Áp Đặc Trưng Quãng Giọng & Âm Sắc của Giọng Đã Lưu lên bản thu (Voice Timbre & Pitch Adaptation)
+    // Bước 1.5: Áp Đặc Trưng Quãng Giọng / Khớp Tông Tự Động (Auto Key Sync)
     double trackF0Hz = 180.0;
     double appliedSemitones = 0.0;
-    if (params.enableVoiceConversion && params.voiceConversionStrength > 0.05) {
+    int autoKeyShift = 0;
+    if (params.autoMatchVocalToMusicKey && detectedKey != null) {
+      autoKeyShift = (detectedKey.suggestedVocalShiftSemitones +
+              params.musicTransposeSemitones.round())
+          .clamp(-6, 6);
+      if (autoKeyShift != 0) {
+        final double keyRatio =
+            math.pow(2.0, autoKeyShift / 12.0).toDouble().clamp(0.5, 2.0);
+        _wsolaPitchShiftInPlace(vLeft, vRight, sr, keyRatio);
+        appliedSemitones = autoKeyShift.toDouble();
+      }
+      if (params.enableVoiceConversion &&
+          params.voiceConversionStrength > 0.05) {
+        // Vẫn áp nhẹ dấu vân tay âm sắc (không dịch tông làm hỏng hòa âm vừa khớp)
+        final convResult = _applyVoiceProfileConversion(
+          vLeft,
+          vRight,
+          sr,
+          params.copyWith(preserveSongKey: true),
+          intensity,
+        );
+        trackF0Hz = convResult.detectedTrackF0Hz;
+      }
+    } else if (params.enableVoiceConversion &&
+        params.voiceConversionStrength > 0.05) {
       final convResult = _applyVoiceProfileConversion(
         vLeft,
         vRight,
@@ -119,16 +157,23 @@ class DspEngineService {
       appliedSemitones = convResult.semitoneShift;
     }
 
-    // Bước 2: Pitch Correction / Auto-Tune (Kéo các khung bị phô về đúng cao độ nốt nhạc)
+    // Bước 2: Pitch Correction / Auto-Tune (Khóa theo 7 nốt Tông Nhạc nếu Scale-Locked được bật)
     int correctedFrames = 0;
     if (params.enablePitchCorrection &&
         params.pitchCorrectionStrength * intensity > 0.05) {
+      final Set<int>? allowedScale =
+          (params.scaleLockedAutoTune && detectedKey != null)
+              ? detectedKey.scalePitchClasses(
+                  transposeSemitones: params.musicTransposeSemitones.round(),
+                )
+              : null;
       correctedFrames = _applyPitchCorrection(
         vLeft,
         vRight,
         sr,
         (params.pitchCorrectionStrength * intensity).clamp(0.0, 1.0),
         params.retuneSpeed.clamp(0.1, 1.0),
+        allowedPitchClasses: allowedScale,
       );
     }
 
@@ -154,12 +199,38 @@ class DspEngineService {
       _applyStereoReverbAndDelay(vLeft, vRight, sr, params, intensity);
     }
 
-    // Bước 6: Hòa trộn thông minh (Smart Stem Re-Mix + Sidechain Ducking nhẹ + Brickwall Limiter)
+    // Bước 5.5: Xử lý riêng cho luồng Nhạc nền (Chỉnh Tone Beat WSOLA + 5-Band EQ Nhạc nền + Stereo Width)
+    final Float64List mLeft = Float64List.fromList(musicStem.leftChannel);
+    final Float64List mRight = Float64List.fromList(musicStem.rightChannel);
+    if (params.enableStemSeparation) {
+      if (params.musicTransposeSemitones.abs() >= 0.35) {
+        final double mRatio = math
+            .pow(2.0, params.musicTransposeSemitones / 12.0)
+            .toDouble()
+            .clamp(0.5, 2.0);
+        _wsolaPitchShiftInPlace(mLeft, mRight, sr, mRatio);
+      }
+      if (params.enableMusicMasteringEq && intensity > 0.01) {
+        _applyMusicStem5BandEq(mLeft, mRight, sr, params, intensity);
+      }
+      final double mWidth = params.musicStereoWidth.clamp(0.4, 1.6);
+      if ((mWidth - 1.0).abs() > 0.02) {
+        for (int i = 0; i < n; i++) {
+          final double mid = 0.5 * (mLeft[i] + mRight[i]);
+          final double side = 0.5 * (mLeft[i] - mRight[i]) * mWidth;
+          mLeft[i] = (mid + side).clamp(-0.98, 0.98);
+          mRight[i] = (mid - side).clamp(-0.98, 0.98);
+        }
+      }
+    }
+
+    // Bước 6: Hòa trộn thông minh (Smart Stem Re-Mix + Sidechain Ducking + Brickwall Limiter)
     final double vocalGainLinear = _dbToLinear(params.vocalGainDb * intensity);
     final double musicGainLinear = params.enableStemSeparation
         ? _dbToLinear(params.musicGainDb)
         : 0.0;
     final double width = params.stereoWidth.clamp(0.5, 1.6);
+    final double duckStrength = params.sidechainDuckingAmount.clamp(0.0, 1.0);
 
     final Float64List outL = Float64List(n);
     final Float64List outR = Float64List(n);
@@ -175,19 +246,24 @@ class DspEngineService {
       vocalSoloL[i] = _softClipLimiter(vl);
       vocalSoloR[i] = _softClipLimiter(vr);
 
-      // Đo bao hình giọng hát để tự động dìm nhẹ nhạc nền 1.5dB khi người dùng lên giọng (Smart Ducking)
+      // Đo bao hình giọng hát để tự động dìm nhẹ nhạc nền khi người dùng lên giọng (Smart Ducking)
       final double vAbs = 0.5 * (vl.abs() + vr.abs());
       vocalEnv = 0.999 * vocalEnv + 0.001 * vAbs;
-      final double duckFactor = (1.0 - vocalEnv * 0.25).clamp(0.78, 1.0);
+      final bool isPureDryMode = !params.enableEq &&
+          !params.enableCompressor &&
+          !params.enableReverbDelay &&
+          !params.enableMusicMasteringEq;
+      final double duckFactor = (isPureDryMode || duckStrength <= 0.01)
+          ? 1.0
+          : (1.0 - vocalEnv * 0.45 * duckStrength).clamp(0.68, 1.0);
 
-      final double ml = musicStem.leftChannel[i] * musicGainLinear * duckFactor;
-      final double mr =
-          musicStem.rightChannel[i] * musicGainLinear * duckFactor;
+      final double ml = mLeft[i] * musicGainLinear * duckFactor;
+      final double mr = mRight[i] * musicGainLinear * duckFactor;
 
       double mixL = vl + ml;
       double mixR = vr + mr;
 
-      // Mở rộng không gian Stereo (Mid-Side Widener)
+      // Mở rộng không gian Stereo tổng (Mid-Side Widener)
       final double mid = 0.5 * (mixL + mixR);
       final double side = 0.5 * (mixL - mixR) * width;
       mixL = mid + side;
@@ -217,7 +293,12 @@ class DspEngineService {
         leftChannel: vocalSoloL,
         rightChannel: vocalSoloR,
       ),
-      musicOnlyAudio: musicStem,
+      musicOnlyAudio: PcmAudioData(
+        sampleRate: sr,
+        channels: 2,
+        leftChannel: mLeft,
+        rightChannel: mRight,
+      ),
       pitchCorrectedFrames: correctedFrames,
       averageGainReductionDb: avgGainReductionDb,
       peakOutputDb: peakDb,
@@ -225,6 +306,8 @@ class DspEngineService {
       trackOriginalF0Hz: trackF0Hz,
       appliedSemitoneShift: appliedSemitones,
       usedAiOnnxModel: usedAiOnnx,
+      detectedMusicKey: detectedKey,
+      appliedAutoKeyShiftSemitones: autoKeyShift,
     );
   }
 
@@ -277,14 +360,19 @@ class DspEngineService {
             .clamp(0.0, 1.0);
 
     double semitoneShift = 0.0;
-    if (rawSemitoneDiff.abs() >= 3.5) {
-      // Khác giới tính hoặc khác quãng giọng lớn (VD: Áp giọng Nam vào diem_xua_nu.wav hoặc ngược lại)
-      // Làm tròn về số nguyên bán cung (hoặc quãng 4 / quãng 5 / quãng 8) để không bị lệch tông với nhạc nền!
-      final double scaled = (rawSemitoneDiff * 0.78 * convStrength).clamp(-12.0, 12.0);
-      semitoneShift = scaled.roundToDouble();
-    } else if (rawSemitoneDiff.abs() >= 1.2) {
-      // Cùng giới tính (VD: Nam Trầm 110Hz vs Nam Cao 165Hz) -> Dịch nhẹ màu âm & độ trầm/thanh
-      semitoneShift = (rawSemitoneDiff * 0.45 * convStrength).clamp(-3.0, 3.0);
+    // Nếu đang ở chế độ "Tự Hát (Giữ nguyên tông nhạc)", tuyệt đối không dịch tông
+    // để giọng hát thật của người dùng luôn khớp 100% hòa âm với nhạc beat karaoke!
+    if (!params.preserveSongKey) {
+      if (rawSemitoneDiff.abs() >= 3.5) {
+        // Khác giới tính hoặc khác quãng giọng lớn (VD: Áp giọng Nam vào diem_xua_nu.wav hoặc ngược lại)
+        // Làm tròn về số nguyên bán cung để không bị lệch tông với nhạc nền!
+        final double scaled =
+            (rawSemitoneDiff * 0.78 * convStrength).clamp(-12.0, 12.0);
+        semitoneShift = scaled.roundToDouble();
+      } else if (rawSemitoneDiff.abs() >= 1.2) {
+        // Cùng giới tính (VD: Nam Trầm 110Hz vs Nam Cao 165Hz) -> Dịch nhẹ màu âm & độ trầm/thanh
+        semitoneShift = (rawSemitoneDiff * 0.45 * convStrength).clamp(-3.0, 3.0);
+      }
     }
 
     // 2. Thực hiện Dịch Quãng Giọng (Pitch Shift) đồng bộ pha WSOLA + Nội suy Cubic
@@ -296,15 +384,22 @@ class DspEngineService {
     }
 
     // 3. Áp dấu vân tay Vòm Họng (Vocal Tract Formant Fingerprint) theo F0 và Spectral Centroid của giọng đã lưu
-    // Giúp phân biệt rõ ràng ngay cả giữa 2 giọng cùng là Nam (VD: Giọng Nam 1 ấm/dày vs Giọng Nam 2 thanh/sáng)
+    // (Ở chế độ Tự Hát giữ nguyên tông, chỉ áp nhẹ 40% để giữ trọn vẹn chất giọng thật)
+    final double timbreScale = params.preserveSongKey ? 0.40 : 1.0;
     final double chestGainDb =
-        ((165.0 - params.targetProfileF0Hz) / 14.0).clamp(-3.5, 4.5) * convStrength;
+        ((165.0 - params.targetProfileF0Hz) / 14.0).clamp(-3.5, 4.5) *
+            convStrength *
+            timbreScale;
     final double throatFormantFreq =
         (params.targetProfileF0Hz * 4.5).clamp(480.0, 1150.0);
     final double throatGainDb =
-        ((params.targetProfileCentroidHz - 1800.0) / 240.0).clamp(-3.0, 3.5) * convStrength;
+        ((params.targetProfileCentroidHz - 1800.0) / 240.0).clamp(-3.0, 3.5) *
+            convStrength *
+            timbreScale;
     final double brightnessDb =
-        ((params.targetProfileCentroidHz - 1850.0) / 260.0).clamp(-3.5, 2.5) * convStrength;
+        ((params.targetProfileCentroidHz - 1850.0) / 260.0).clamp(-3.5, 2.5) *
+            convStrength *
+            timbreScale;
 
     final chestL = _BiquadFilter.peaking(sr, 195.0, 0.9, chestGainDb);
     final chestR = _BiquadFilter.peaking(sr, 195.0, 0.9, chestGainDb);
@@ -517,15 +612,17 @@ class DspEngineService {
   }
 
   /// Chỉnh cao độ (Auto-Tune) đồng bộ pha WSOLA không trộn chồng Dry/Wet:
-  /// - Chỉ can thiệp khi cao độ thực tế bị lệch khỏi tâm nốt nhạc > 24 cents (bảo toàn luyến láy & rung tự nhiên).
-  /// - Thay thế trực tiếp bằng khung sóng đồng bộ pha (Phase-Matched Overlap-Add) nên tuyệt đối không bị tiếng "rung pha / chorus".
+  /// - Hỗ trợ **Scale-Locked Auto-Tune**: Khi truyền [allowedPitchClasses] (7 bậc âm giai của Tông Nhạc),
+  ///   chỉ kéo nốt bị chênh về các nốt nằm đúng trong hợp âm bài hát, chống lạc tông!
+  /// - Giữ Deadband 24 cents để bảo toàn luyến láy & rung tự nhiên.
   int _applyPitchCorrection(
     Float64List left,
     Float64List right,
     int sr,
     double strength,
-    double retuneSpeed,
-  ) {
+    double retuneSpeed, {
+    Set<int>? allowedPitchClasses,
+  }) {
     const int winLen = 1024;
     const int hopSize = 512;
     const int searchRadius = 160;
@@ -558,15 +655,29 @@ class DspEngineService {
         if (detectedHz >= 85.0 && detectedHz <= 880.0) {
           final double midiNote =
               69.0 + 12.0 * (math.log(detectedHz / 440.0) / math.ln2);
-          final double nearestMidi = midiNote.roundToDouble();
-          final double centError = (midiNote - nearestMidi).abs() * 100.0;
+          double targetMidi = midiNote.roundToDouble();
+          if (allowedPitchClasses != null && allowedPitchClasses.isNotEmpty) {
+            final int center = midiNote.round();
+            double bestDist = 999.0;
+            for (int m = center - 5; m <= center + 5; m++) {
+              final int pc = ((m % 12) + 12) % 12;
+              if (allowedPitchClasses.contains(pc)) {
+                final double dist = (midiNote - m).abs();
+                if (dist < bestDist) {
+                  bestDist = dist;
+                  targetMidi = m.toDouble();
+                }
+              }
+            }
+          }
+          final double centError = (midiNote - targetMidi).abs() * 100.0;
 
           // Deadband 24 cents: giữ nguyên độ rung & luyến láy tự nhiên nếu hát đúng nốt
           if (centError > 24.0) {
             final double targetHz =
-                440.0 * math.pow(2.0, (nearestMidi - 69.0) / 12.0);
-            final double rawRatio = (targetHz / detectedHz).clamp(0.93, 1.07);
-            targetRatio = 1.0 + (rawRatio - 1.0) * strength * 0.75;
+                440.0 * math.pow(2.0, (targetMidi - 69.0) / 12.0);
+            final double rawRatio = (targetHz / detectedHz).clamp(0.88, 1.12);
+            targetRatio = 1.0 + (rawRatio - 1.0) * strength * 0.78;
           }
         }
       }
@@ -634,6 +745,53 @@ class DspEngineService {
       }
     }
     return correctedCount;
+  }
+
+  /// 5-Band Parametric EQ chuyên sâu dành riêng cho luồng Nhạc nền (Music Stem)
+  void _applyMusicStem5BandEq(
+    Float64List left,
+    Float64List right,
+    int sr,
+    DspParameters params,
+    double intensity,
+  ) {
+    final double scale = intensity.clamp(0.5, 1.4);
+    final List<_BiquadFilter> filtersL = [
+      _BiquadFilter.lowShelf(sr, 100.0, params.musicEqSub100HzDb * scale),
+      _BiquadFilter.peaking(sr, 280.0, 0.9, params.musicEqLowMid280HzDb * scale),
+      _BiquadFilter.peaking(sr, 1200.0, 1.0, params.musicEqMid1200HzDb * scale),
+      _BiquadFilter.peaking(
+        sr,
+        3400.0,
+        0.9,
+        params.musicEqHighMid3500HzDb * scale,
+      ),
+      _BiquadFilter.highShelf(sr, 8000.0, params.musicEqAir10kHzDb * scale),
+    ];
+
+    final List<_BiquadFilter> filtersR = [
+      _BiquadFilter.lowShelf(sr, 100.0, params.musicEqSub100HzDb * scale),
+      _BiquadFilter.peaking(sr, 280.0, 0.9, params.musicEqLowMid280HzDb * scale),
+      _BiquadFilter.peaking(sr, 1200.0, 1.0, params.musicEqMid1200HzDb * scale),
+      _BiquadFilter.peaking(
+        sr,
+        3400.0,
+        0.9,
+        params.musicEqHighMid3500HzDb * scale,
+      ),
+      _BiquadFilter.highShelf(sr, 8000.0, params.musicEqAir10kHzDb * scale),
+    ];
+
+    for (int i = 0; i < left.length; i++) {
+      double sL = left[i];
+      double sR = right[i];
+      for (int b = 0; b < filtersL.length; b++) {
+        sL = filtersL[b].process(sL);
+        sR = filtersR[b].process(sR);
+      }
+      left[i] = sL;
+      right[i] = sR;
+    }
   }
 
   void _apply5BandEq(

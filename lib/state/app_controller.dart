@@ -48,11 +48,13 @@ class AppController extends ChangeNotifier {
   double _liveMicAmplitudeDb = -60.0;
   Timer? _ampTimer;
 
-  // Trạng thái Karaoke Studio
-  StudioControlMode _controlMode = StudioControlMode.oneTouchAuto;
+  // Trạng thái Karaoke Studio (3 tab màu riêng: Hòa trộn, Giọng Vocal, Nhạc nền)
+  StudioControlMode _controlMode = StudioControlMode.mix;
   KaraokePresetStyle _selectedPreset = KaraokePresetStyle.aiProfileMatched;
   double _presetIntensity = 1.0;
   double _vocalMusicBalance = 0.0; // -1.0 -> +1.0
+  bool _preserveSongKey = false; // false = Đổi tông theo giọng lưu; true = Tự hát giữ nguyên tông nhạc
+  bool _isPureDryVoiceTest = false;
   late DspParameters _dspParams;
 
   String _currentTrackName = 'Bản thu Karaoke Mẫu (Giọng + Loa ngoài)';
@@ -101,6 +103,7 @@ class AppController extends ChangeNotifier {
   KaraokePresetStyle get selectedPreset => _selectedPreset;
   double get presetIntensity => _presetIntensity;
   double get vocalMusicBalance => _vocalMusicBalance;
+  bool get preserveSongKey => _preserveSongKey;
   DspParameters get dspParams => _dspParams;
 
   String get currentTrackName => _currentTrackName;
@@ -116,6 +119,7 @@ class AppController extends ChangeNotifier {
 
   bool get isBusyProcessing => _isBusyProcessing;
   bool get isRecordingKaraoke => _isRecordingKaraoke;
+  bool get isPureDryVoiceTest => _isPureDryVoiceTest;
   String get statusMessage => _statusMessage;
 
   bool get isPlaying => _isPlaying;
@@ -387,19 +391,38 @@ class AppController extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Chọn một hồ sơ giọng đã lưu trong danh sách và cập nhật ngay theo chế độ hiện tại
+  /// Chọn một hồ sơ giọng đã lưu trong danh sách và cập nhật ngay
   Future<void> selectSavedVoiceProfile(UserVoiceProfile profile) async {
     _voiceProfile = profile;
     _hasCustomProfile = true;
-    if (_controlMode == StudioControlMode.smartPresets) {
-      _dspParams = DspParameters.fromPreset(
+    if (_isPureDryVoiceTest) {
+      _dspParams = _dspParams.copyWith(
+        preserveSongKey: _preserveSongKey,
+        targetProfileF0Hz: _voiceProfile.speakingF0MeanHz.clamp(85.0, 400.0),
+        targetProfileCentroidHz:
+            _voiceProfile.spectralCentroidHz.clamp(950.0, 3600.0),
+      );
+    } else {
+      final presetParams = DspParameters.fromPreset(
         _selectedPreset,
         _voiceProfile,
         intensity: _presetIntensity,
         vocalMusicBalance: _vocalMusicBalance,
+        preserveSongKey: _preserveSongKey,
       );
-    } else {
-      _dspParams = DspParameters.fromVoiceProfile(_voiceProfile);
+      _dspParams = presetParams.copyWith(
+        autoMatchVocalToMusicKey: _dspParams.autoMatchVocalToMusicKey,
+        scaleLockedAutoTune: _dspParams.scaleLockedAutoTune,
+        sidechainDuckingAmount: _dspParams.sidechainDuckingAmount,
+        enableMusicMasteringEq: _dspParams.enableMusicMasteringEq,
+        musicTransposeSemitones: _dspParams.musicTransposeSemitones,
+        musicStereoWidth: _dspParams.musicStereoWidth,
+        musicEqSub100HzDb: _dspParams.musicEqSub100HzDb,
+        musicEqLowMid280HzDb: _dspParams.musicEqLowMid280HzDb,
+        musicEqMid1200HzDb: _dspParams.musicEqMid1200HzDb,
+        musicEqHighMid3500HzDb: _dspParams.musicEqHighMid3500HzDb,
+        musicEqAir10kHzDb: _dspParams.musicEqAir10kHzDb,
+      );
     }
     await applyDspToCurrentTrack();
     _statusMessage = 'Đang áp dụng hồ sơ giọng "${profile.name}"';
@@ -581,6 +604,9 @@ class AppController extends ChangeNotifier {
           _totalDuration = Duration(
             milliseconds: (pcm.durationSeconds * 1000).round(),
           );
+          // Khi thu Mic hát live cùng nhạc Karaoke, mặc định bật giữ đúng tông nhạc beat
+          _preserveSongKey = true;
+          _dspParams = _dspParams.copyWith(preserveSongKey: true);
           await applyDspToCurrentTrack();
         }
       } catch (e) {
@@ -623,58 +649,110 @@ class AppController extends ChangeNotifier {
     }
   }
 
-  /// Chuyển đổi giữa 3 chế độ điều khiển (Option 1: 1-Touch, Option 2: Smart Presets, Option 3: Pro Mixer)
+  /// Chuyển đổi mục tiêu xử lý:
+  /// - `false`: Áp/Đổi tông & màu âm sang Giọng đã lưu (hợp khi test áp giọng lên bản thu mẫu/ca sĩ khác)
+  /// - `true`: Tự Hát (Giữ nguyên tông bài hát để không lệch beat, chỉ làm đẹp giọng thật + nhạc nền)
+  Future<void> setPreserveSongKey(bool preserve) async {
+    if (_preserveSongKey == preserve && _dspParams.preserveSongKey == preserve) {
+      return;
+    }
+    _preserveSongKey = preserve;
+    _dspParams = _dspParams.copyWith(preserveSongKey: preserve);
+    notifyListeners();
+    await applyDspToCurrentTrack();
+  }
+
+  /// Chuyển đổi giữa 3 Tab màu riêng trong Studio: Hòa trộn | Giọng Vocal | Nhạc nền
   Future<void> setStudioControlMode(StudioControlMode mode) async {
     if (_controlMode == mode) return;
     _controlMode = mode;
-
-    if (mode == StudioControlMode.oneTouchAuto) {
-      _dspParams = DspParameters.fromVoiceProfile(_voiceProfile);
-      await applyDspToCurrentTrack();
-    } else if (mode == StudioControlMode.smartPresets) {
-      _dspParams = DspParameters.fromPreset(
-        _selectedPreset,
-        _voiceProfile,
-        intensity: _presetIntensity,
-        vocalMusicBalance: _vocalMusicBalance,
-      );
-      await applyDspToCurrentTrack();
-    } else {
-      notifyListeners();
-    }
+    notifyListeners();
   }
 
-  /// Thay đổi Preset hoặc Thanh kéo Cường độ ở Chế độ 2 (Smart Presets)
+  /// Thay đổi Phong cách nhanh hoặc Thanh kéo ở tab Hòa trộn
   Future<void> updatePresetConfiguration({
     KaraokePresetStyle? preset,
     double? intensity,
     double? vocalMusicBalance,
   }) async {
+    _isPureDryVoiceTest = false;
     if (preset != null) _selectedPreset = preset;
     if (intensity != null) _presetIntensity = intensity;
     if (vocalMusicBalance != null) _vocalMusicBalance = vocalMusicBalance;
 
-    _dspParams = DspParameters.fromPreset(
+    final base = DspParameters.fromPreset(
       _selectedPreset,
       _voiceProfile,
       intensity: _presetIntensity,
       vocalMusicBalance: _vocalMusicBalance,
+      preserveSongKey: _preserveSongKey,
+    );
+    _dspParams = base.copyWith(
+      autoMatchVocalToMusicKey: _dspParams.autoMatchVocalToMusicKey,
+      scaleLockedAutoTune: _dspParams.scaleLockedAutoTune,
+      sidechainDuckingAmount: _dspParams.sidechainDuckingAmount,
+      enableMusicMasteringEq: _dspParams.enableMusicMasteringEq,
+      musicTransposeSemitones: _dspParams.musicTransposeSemitones,
+      musicStereoWidth: _dspParams.musicStereoWidth,
+      musicEqSub100HzDb: _dspParams.musicEqSub100HzDb,
+      musicEqLowMid280HzDb: _dspParams.musicEqLowMid280HzDb,
+      musicEqMid1200HzDb: _dspParams.musicEqMid1200HzDb,
+      musicEqHighMid3500HzDb: _dspParams.musicEqHighMid3500HzDb,
+      musicEqAir10kHzDb: _dspParams.musicEqAir10kHzDb,
     );
     notifyListeners();
   }
 
-  /// Thay đổi tham số chi tiết ở Chế độ 3 (Pro Mixer)
+  /// Cập nhật tham số chuyên sâu ở bất kỳ tab nào (Hòa trộn / Giọng Vocal / Nhạc nền)
   void updateProMixerParams(DspParameters newParams) {
+    _isPureDryVoiceTest = !newParams.enableEq &&
+        !newParams.enableCompressor &&
+        !newParams.enableReverbDelay &&
+        !newParams.enableMusicMasteringEq;
+    _preserveSongKey = newParams.preserveSongKey;
     _dspParams = newParams;
     notifyListeners();
   }
 
-  /// Reset bộ tham số về đúng gợi ý AI từ Hồ sơ giọng của người dùng
+  /// Reset bộ tham số về đúng gợi ý AI từ Hồ sơ giọng của người dùng (1-Touch AI Đầy Đủ)
   Future<void> resetDspToVoiceProfile() async {
-    _dspParams = DspParameters.fromVoiceProfile(_voiceProfile);
+    _isPureDryVoiceTest = false;
+    _dspParams = DspParameters.fromVoiceProfile(
+      _voiceProfile,
+      preserveSongKey: _preserveSongKey,
+    );
     _selectedPreset = KaraokePresetStyle.aiProfileMatched;
     _presetIntensity = 1.0;
     _vocalMusicBalance = 0.0;
+    notifyListeners();
+    await applyDspToCurrentTrack();
+  }
+
+  /// Reset riêng 5-Band EQ & Tone của Nhạc nền về mặc định Mastering
+  Future<void> resetMusicStemSettings() async {
+    _dspParams = _dspParams.copyWith(
+      enableMusicMasteringEq: true,
+      musicTransposeSemitones: 0.0,
+      musicStereoWidth: 1.12,
+      musicEqSub100HzDb: 0.8,
+      musicEqLowMid280HzDb: -1.8,
+      musicEqMid1200HzDb: -1.2,
+      musicEqHighMid3500HzDb: -0.8,
+      musicEqAir10kHzDb: 1.8,
+    );
+    notifyListeners();
+    await applyDspToCurrentTrack();
+  }
+
+  /// Chế độ nhanh: CHỈ đổi giọng theo hồ sơ đã lưu lên file gốc, tắt mọi hiệu ứng làm đẹp (EQ/Reverb/Delay/AutoTune)
+  Future<void> applyPureVoiceConversionOnly() async {
+    _isPureDryVoiceTest = true;
+    _preserveSongKey = false;
+    _dspParams = DspParameters.pureVoiceConversionOnly(
+      _voiceProfile,
+      preserveSongKey: false,
+    );
+    notifyListeners();
     await applyDspToCurrentTrack();
   }
 
@@ -810,10 +888,17 @@ class AppController extends ChangeNotifier {
     _musicSoloFilePath = isoResult.musPath;
 
     _isBusyProcessing = false;
-    final aiTag = report.usedAiOnnxModel ? '[AI UVR-ONNX]' : '[DSP STFT]';
-    final shiftTxt = report.appliedSemitoneShift.abs() >= 0.35
-        ? '$aiTag Dịch ${report.appliedSemitoneShift >= 0 ? "+" : ""}${report.appliedSemitoneShift.toStringAsFixed(1)} bán cung (${report.trackOriginalF0Hz.round()}Hz -> F0 giọng lưu ${_voiceProfile.speakingF0MeanHz.round()}Hz)'
-        : '$aiTag Khớp màu giọng "${_voiceProfile.name}" (F0 ${_voiceProfile.speakingF0MeanHz.round()}Hz)';
+    final aiTag = report.usedAiOnnxModel ? '[AI UVR]' : '[DSP]';
+    final keyTag = report.detectedMusicKey != null
+        ? ' • Key ${report.detectedMusicKey!.shortName}'
+        : '';
+    final shiftTxt = report.appliedAutoKeyShiftSemitones != 0
+        ? '$aiTag Khớp Tông ${report.appliedAutoKeyShiftSemitones > 0 ? "+" : ""}${report.appliedAutoKeyShiftSemitones} st$keyTag'
+        : (_dspParams.preserveSongKey
+            ? '$aiTag Tự Hát (Giữ Tông)$keyTag'
+            : (report.appliedSemitoneShift.abs() >= 0.35
+                ? '$aiTag Dịch ${report.appliedSemitoneShift >= 0 ? "+" : ""}${report.appliedSemitoneShift.toStringAsFixed(1)} st$keyTag'
+                : '$aiTag "${_voiceProfile.name}"$keyTag'));
     _statusMessage =
         '$shiftTxt • ${report.processingTimeMs}ms • ${report.pitchCorrectedFrames} khung Pitch';
     notifyListeners();

@@ -96,7 +96,7 @@ class KaraokeStudioScreen extends StatelessWidget {
                           return DropdownMenuItem<String>(
                             value: item.id,
                             child: Text(
-                              '${item.name} (${item.vocalType.title.split(' ').first})',
+                              item.displayLabelWithType,
                               overflow: TextOverflow.ellipsis,
                             ),
                           );
@@ -297,6 +297,7 @@ class KaraokeStudioScreen extends StatelessWidget {
 
   Widget _buildDspReportBanner(BuildContext context) {
     final report = controller.lastReport;
+    final detectedKey = report?.detectedMusicKey;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
       decoration: BoxDecoration(
@@ -319,13 +320,33 @@ class KaraokeStudioScreen extends StatelessWidget {
             ),
           const SizedBox(width: 10),
           Expanded(
-            child: Text(
-              controller.statusMessage,
-              style: const TextStyle(
-                fontSize: 12,
-                color: AppTheme.textPrimary,
-                fontWeight: FontWeight.w500,
-              ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  controller.statusMessage,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    color: AppTheme.textPrimary,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+                if (detectedKey != null && !controller.isBusyProcessing)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 3),
+                    child: Text(
+                      'Chromagram AI: Tông ${detectedKey.labelVi} (${(detectedKey.confidence * 100).round()}%)'
+                      '${detectedKey.suggestedVocalShiftSemitones != 0 ? " • Độ lệch giọng/nhạc: ${detectedKey.suggestedVocalShiftSemitones > 0 ? "+" : ""}${detectedKey.suggestedVocalShiftSemitones} bán cung" : " • Giọng khớp tông nhạc"}',
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                        color: detectedKey.suggestedVocalShiftSemitones != 0
+                            ? AppTheme.accentAmber
+                            : AppTheme.accentCyan,
+                      ),
+                    ),
+                  ),
+              ],
             ),
           ),
           if (report != null && controller.enhancedFilePath != null)

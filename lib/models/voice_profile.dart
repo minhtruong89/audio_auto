@@ -67,18 +67,34 @@ class UserVoiceProfile {
     required this.eqCompensationGainsDb,
   });
 
-  UserVoiceProfile copyWith({String? id, String? name, DateTime? createdAt}) {
+  bool get isMaleVoice =>
+      vocalType == VocalRangeType.bass ||
+      vocalType == VocalRangeType.baritone ||
+      vocalType == VocalRangeType.tenor;
+
+  String get displayLabelWithType {
+    final tag = vocalType.title.split(' ').first;
+    return name.contains('($tag)') ? name : '$name ($tag)';
+  }
+
+  UserVoiceProfile copyWith({
+    String? id,
+    String? name,
+    DateTime? createdAt,
+    double? speakingF0MeanHz,
+    VocalRangeType? vocalType,
+  }) {
     return UserVoiceProfile(
       id: id ?? this.id,
       name: name ?? this.name,
       createdAt: createdAt ?? this.createdAt,
       noiseFloorDb: noiseFloorDb,
-      speakingF0MeanHz: speakingF0MeanHz,
+      speakingF0MeanHz: speakingF0MeanHz ?? this.speakingF0MeanHz,
       spectralCentroidHz: spectralCentroidHz,
       minPitchHz: minPitchHz,
       maxPitchHz: maxPitchHz,
       comfortZoneHz: comfortZoneHz,
-      vocalType: vocalType,
+      vocalType: vocalType ?? this.vocalType,
       pitchJitterPercent: pitchJitterPercent,
       vibratoRateHz: vibratoRateHz,
       dynamicStabilityDb: dynamicStabilityDb,

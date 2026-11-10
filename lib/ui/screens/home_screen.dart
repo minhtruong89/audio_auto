@@ -48,14 +48,42 @@ class _HomeScreenState extends State<HomeScreen> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Text(
-                        'VocalAI Karaoke Studio',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          fontSize: 17,
-                          fontWeight: FontWeight.w800,
-                        ),
+                      Row(
+                        children: [
+                          const Flexible(
+                            child: Text(
+                              'Sonca Autotune',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 17,
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 7),
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 7,
+                              vertical: 2,
+                            ),
+                            decoration: BoxDecoration(
+                              color: AppTheme.accentCyan.withValues(alpha: 0.16),
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(
+                                color: AppTheme.accentCyan.withValues(alpha: 0.55),
+                              ),
+                            ),
+                            child: const Text(
+                              'v1.0.0',
+                              style: TextStyle(
+                                fontSize: 10.5,
+                                fontWeight: FontWeight.w800,
+                                color: AppTheme.accentCyan,
+                              ),
+                            ),
+                          ),
+                        ],
                       ),
                       Text(
                         'On-Device AI + DSP • ${profile.vocalType.title}',
@@ -123,7 +151,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   color: AppTheme.accentCyan,
                 ),
                 label: widget.controller.hasCustomProfile
-                    ? '2. Làm Đẹp Karaoke (3 Chế Độ)'
+                    ? '2. Làm Đẹp Karaoke'
                     : '2. Làm Đẹp Karaoke (Chưa lưu giọng)',
               ),
             ],

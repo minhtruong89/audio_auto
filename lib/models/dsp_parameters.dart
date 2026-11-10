@@ -3,17 +3,31 @@ import 'voice_profile.dart';
 
 /// Toàn bộ thông số của Pipeline Tách Nhạc & Chuỗi 5 Hiệu ứng DSP Làm đẹp Giọng
 class DspParameters {
-  // 0. Tách giọng & Cân bằng Stem (Vocal / Instrumental từ loa ngoài)
+  // 0. Tách giọng & Cân bằng Stem / Hòa trộn (Mix)
   final bool enableStemSeparation;
   final double vocalGainDb; // Độ lớn giọng hát sau khi tách (-6dB -> +8dB)
   final double musicGainDb; // Độ lớn nhạc nền từ loa (-12dB -> +4dB)
-  final double stereoWidth; // Độ rộng không gian stereo (0.5 -> 1.5)
+  final double stereoWidth; // Độ rộng không gian stereo tổng (0.5 -> 1.5)
+  final double sidechainDuckingAmount; // Mức dìm nhẹ nhạc khi cất giọng (0.0 -> 1.0)
+  final bool autoMatchVocalToMusicKey; // Tự động kéo tông giọng về khớp tông nhạc nền phát hiện được
+  final bool scaleLockedAutoTune; // Khóa Auto-Tune chỉ kéo về 7 nốt hợp âm của tông nhạc
 
   // 0.5. Chuyển đổi Đặc trưng Giọng & Quãng Giọng (Voice Timbre & Pitch Adaptation)
   final bool enableVoiceConversion;
+  final bool preserveSongKey; // true = Tự hát thật (KHÔNG dịch bán cung gây lệch tông nhạc beat), false = Đổi tông theo giọng mẫu
   final double targetProfileF0Hz; // Tần số F0 đặc trưng của giọng đã lưu (Hz)
   final double targetProfileCentroidHz; // Trọng tâm âm sắc của giọng đã lưu (Hz)
   final double voiceConversionStrength; // Mức độ ép màu giọng & cao độ về giọng đã lưu (0.0 -> 1.0)
+
+  // 0.8. Tùy chỉnh chuyên sâu riêng cho Nhạc nền (Music Stem EQ & Tone)
+  final bool enableMusicMasteringEq;
+  final double musicTransposeSemitones; // Chỉnh Tone Nhạc (-6.0 -> +6.0 bán cung)
+  final double musicStereoWidth; // Độ rộng Stereo riêng cho Nhạc nền (0.5 -> 1.6)
+  final double musicEqSub100HzDb; // Bass nhạc nền (100Hz)
+  final double musicEqLowMid280HzDb; // Độ ấm / Cắt ù phòng (280Hz)
+  final double musicEqMid1200HzDb; // Trung âm nhạc nền (1.2kHz)
+  final double musicEqHighMid3500HzDb; // Nhạc cụ / Vocal Pocket (3.5kHz)
+  final double musicEqAir10kHzDb; // Độ sáng nhạc nền (10kHz)
 
   // 1. Khử tạp âm & De-esser (Giảm tiếng xì/chói)
   final bool enableNoiseGateAndDeEsser;
@@ -57,7 +71,19 @@ class DspParameters {
     this.vocalGainDb = 3.0,
     this.musicGainDb = -1.5,
     this.stereoWidth = 1.15,
+    this.sidechainDuckingAmount = 0.45,
+    this.autoMatchVocalToMusicKey = false,
+    this.scaleLockedAutoTune = true,
+    this.enableMusicMasteringEq = true,
+    this.musicTransposeSemitones = 0.0,
+    this.musicStereoWidth = 1.12,
+    this.musicEqSub100HzDb = 0.8,
+    this.musicEqLowMid280HzDb = -1.8,
+    this.musicEqMid1200HzDb = -1.2,
+    this.musicEqHighMid3500HzDb = -0.8,
+    this.musicEqAir10kHzDb = 1.8,
     this.enableVoiceConversion = true,
+    this.preserveSongKey = false,
     this.targetProfileF0Hz = 155.0,
     this.targetProfileCentroidHz = 1850.0,
     this.voiceConversionStrength = 0.85,
@@ -90,7 +116,10 @@ class DspParameters {
 
   /// Tự động nội suy bộ tham số DSP tối ưu từ Hồ sơ Giọng của người dùng (1-Touch Auto)
   /// Mỗi đặc trưng giọng (F0, Centroid, Dynamic, Jitter, Sibilance) sẽ định hình màu âm riêng biệt
-  factory DspParameters.fromVoiceProfile(UserVoiceProfile profile) {
+  factory DspParameters.fromVoiceProfile(
+    UserVoiceProfile profile, {
+    bool preserveSongKey = false,
+  }) {
     final gains = profile.eqCompensationGainsDb;
     final pitchNeed = (profile.pitchJitterPercent / 4.2).clamp(0.22, 0.90);
     final deEssNeed = (profile.sibilanceRatio * 1.45).clamp(0.18, 0.85);
@@ -111,7 +140,19 @@ class DspParameters {
       vocalGainDb: (2.6 + (1.0 - profile.powerScore) * 1.8).clamp(2.2, 4.5),
       musicGainDb: -1.6,
       stereoWidth: isDeepVoice ? 1.12 : 1.24,
+      sidechainDuckingAmount: 0.45,
+      autoMatchVocalToMusicKey: false,
+      scaleLockedAutoTune: true,
+      enableMusicMasteringEq: true,
+      musicTransposeSemitones: 0.0,
+      musicStereoWidth: 1.12,
+      musicEqSub100HzDb: 0.8,
+      musicEqLowMid280HzDb: -1.8,
+      musicEqMid1200HzDb: -1.2,
+      musicEqHighMid3500HzDb: -0.8,
+      musicEqAir10kHzDb: 1.8,
       enableVoiceConversion: true,
+      preserveSongKey: preserveSongKey,
       targetProfileF0Hz: profile.speakingF0MeanHz.clamp(85.0, 400.0),
       targetProfileCentroidHz: profile.spectralCentroidHz.clamp(950.0, 3600.0),
       voiceConversionStrength: 0.88,
@@ -143,14 +184,61 @@ class DspParameters {
     );
   }
 
+  /// Chế độ Thử Nghiệm Thuần Túy: CHỈ tách giọng và đổi đặc trưng sang Giọng Đã Lưu
+  /// (Tắt toàn bộ Auto-Tune, EQ làm đẹp, Compressor, De-Esser, Reverb và Echo Delay)
+  factory DspParameters.pureVoiceConversionOnly(
+    UserVoiceProfile profile, {
+    bool preserveSongKey = false,
+  }) {
+    return DspParameters(
+      enableStemSeparation: true,
+      vocalGainDb: 0.0,
+      musicGainDb: 0.0,
+      stereoWidth: 1.0,
+      sidechainDuckingAmount: 0.0,
+      autoMatchVocalToMusicKey: false,
+      scaleLockedAutoTune: false,
+      enableMusicMasteringEq: false,
+      musicTransposeSemitones: 0.0,
+      musicStereoWidth: 1.0,
+      musicEqSub100HzDb: 0.0,
+      musicEqLowMid280HzDb: 0.0,
+      musicEqMid1200HzDb: 0.0,
+      musicEqHighMid3500HzDb: 0.0,
+      musicEqAir10kHzDb: 0.0,
+      enableVoiceConversion: true,
+      preserveSongKey: preserveSongKey,
+      targetProfileF0Hz: profile.speakingF0MeanHz.clamp(85.0, 400.0),
+      targetProfileCentroidHz: profile.spectralCentroidHz.clamp(950.0, 3600.0),
+      voiceConversionStrength: 1.0,
+      enableNoiseGateAndDeEsser: false,
+      enablePitchCorrection: false,
+      enableEq: false,
+      eqSub100HzDb: 0.0,
+      eqLowMid280HzDb: 0.0,
+      eqMid1200HzDb: 0.0,
+      eqHighMid3500HzDb: 0.0,
+      eqAir10kHzDb: 0.0,
+      enableCompressor: false,
+      enableReverbDelay: false,
+      reverbWetMix: 0.0,
+      delayMix: 0.0,
+      masterIntensity: 1.0,
+    );
+  }
+
   /// Tạo bộ tham số theo Preset + kết hợp chặt chẽ với đặc trưng Hồ sơ giọng của người dùng
   factory DspParameters.fromPreset(
     KaraokePresetStyle preset,
     UserVoiceProfile profile, {
     double intensity = 1.0,
     double vocalMusicBalance = 0.0, // -1.0 (nhiều nhạc) -> +1.0 (nhiều giọng)
+    bool preserveSongKey = false,
   }) {
-    final base = DspParameters.fromVoiceProfile(profile);
+    final base = DspParameters.fromVoiceProfile(
+      profile,
+      preserveSongKey: preserveSongKey,
+    );
     final vocalBoost = base.vocalGainDb + vocalMusicBalance * 3.5;
     final musicAtten = -1.5 - vocalMusicBalance * 3.0;
 
@@ -250,7 +338,19 @@ class DspParameters {
     double? vocalGainDb,
     double? musicGainDb,
     double? stereoWidth,
+    double? sidechainDuckingAmount,
+    bool? autoMatchVocalToMusicKey,
+    bool? scaleLockedAutoTune,
+    bool? enableMusicMasteringEq,
+    double? musicTransposeSemitones,
+    double? musicStereoWidth,
+    double? musicEqSub100HzDb,
+    double? musicEqLowMid280HzDb,
+    double? musicEqMid1200HzDb,
+    double? musicEqHighMid3500HzDb,
+    double? musicEqAir10kHzDb,
     bool? enableVoiceConversion,
+    bool? preserveSongKey,
     double? targetProfileF0Hz,
     double? targetProfileCentroidHz,
     double? voiceConversionStrength,
@@ -285,8 +385,25 @@ class DspParameters {
       vocalGainDb: vocalGainDb ?? this.vocalGainDb,
       musicGainDb: musicGainDb ?? this.musicGainDb,
       stereoWidth: stereoWidth ?? this.stereoWidth,
+      sidechainDuckingAmount:
+          sidechainDuckingAmount ?? this.sidechainDuckingAmount,
+      autoMatchVocalToMusicKey:
+          autoMatchVocalToMusicKey ?? this.autoMatchVocalToMusicKey,
+      scaleLockedAutoTune: scaleLockedAutoTune ?? this.scaleLockedAutoTune,
+      enableMusicMasteringEq:
+          enableMusicMasteringEq ?? this.enableMusicMasteringEq,
+      musicTransposeSemitones:
+          musicTransposeSemitones ?? this.musicTransposeSemitones,
+      musicStereoWidth: musicStereoWidth ?? this.musicStereoWidth,
+      musicEqSub100HzDb: musicEqSub100HzDb ?? this.musicEqSub100HzDb,
+      musicEqLowMid280HzDb: musicEqLowMid280HzDb ?? this.musicEqLowMid280HzDb,
+      musicEqMid1200HzDb: musicEqMid1200HzDb ?? this.musicEqMid1200HzDb,
+      musicEqHighMid3500HzDb:
+          musicEqHighMid3500HzDb ?? this.musicEqHighMid3500HzDb,
+      musicEqAir10kHzDb: musicEqAir10kHzDb ?? this.musicEqAir10kHzDb,
       enableVoiceConversion:
           enableVoiceConversion ?? this.enableVoiceConversion,
+      preserveSongKey: preserveSongKey ?? this.preserveSongKey,
       targetProfileF0Hz: targetProfileF0Hz ?? this.targetProfileF0Hz,
       targetProfileCentroidHz:
           targetProfileCentroidHz ?? this.targetProfileCentroidHz,

@@ -73,8 +73,12 @@ class VoiceAnalyzerService {
       );
     }
 
-    const int frameSize = 1024;
+    const int frameSize = 2048;
     const int hopSize = 512;
+    final bool isGlideStep = stepIndex == 1;
+    final double yinMinFreq = 65.0;
+    final double yinMaxFreq = isGlideStep ? 850.0 : 360.0;
+
     final List<double> frameRmsDb = [];
     final List<double> detectedPitches = [];
     int clippingSamples = 0;
@@ -82,6 +86,7 @@ class VoiceAnalyzerService {
       if (mono[i].abs() >= 0.985) clippingSamples++;
     }
 
+    // Lần 1: Đo mức năng lượng và ngưỡng tạp âm nền trước để lọc khung yên lặng chính xác
     for (int start = 0; start + frameSize <= mono.length; start += hopSize) {
       double sumSq = 0.0;
       for (int i = 0; i < frameSize; i++) {
@@ -91,23 +96,31 @@ class VoiceAnalyzerService {
       final double rms = math.sqrt(sumSq / frameSize);
       final double db = 20.0 * math.log(math.max(rms, 1e-5)) / math.ln10;
       frameRmsDb.add(db);
-
-      // Chỉ đo cao độ trên các khung có năng lượng giọng hát rõ (trên -42dB)
-      if (db > -42.0) {
-        final double pitch = detectPitchYin(
-          Float64List.sublistView(mono, start, start + frameSize),
-          sr,
-        );
-        if (pitch >= 75.0 && pitch <= 1050.0) {
-          detectedPitches.add(pitch);
-        }
-      }
     }
 
     // 1. Tính ngưỡng tạp âm nền (15% phân vị thấp nhất của RMS dB)
     final sortedRms = List<double>.from(frameRmsDb)..sort();
-    final int noiseIdx = (sortedRms.length * 0.15).floor().clamp(0, sortedRms.length - 1);
+    final int noiseIdx =
+        (sortedRms.length * 0.15).floor().clamp(0, sortedRms.length - 1);
     final double noiseFloorDb = sortedRms[noiseIdx].clamp(-65.0, -25.0);
+    final double voicedGateDb = math.max(-38.0, noiseFloorDb + 7.5);
+
+    // Lần 2: Chạy YIN 2048 mẫu (chống nhảy bậc 8 octave-doubling) trên các khung có tiếng người rõ
+    int frameIdx = 0;
+    for (int start = 0; start + frameSize <= mono.length; start += hopSize) {
+      final double db = frameRmsDb[frameIdx++];
+      if (db > voicedGateDb) {
+        final double pitch = detectPitchYin(
+          Float64List.sublistView(mono, start, start + frameSize),
+          sr,
+          minFreqHz: yinMinFreq,
+          maxFreqHz: yinMaxFreq,
+        );
+        if (pitch >= yinMinFreq && pitch <= yinMaxFreq) {
+          detectedPitches.add(pitch);
+        }
+      }
+    }
 
     // 2. Độ ổn định âm lượng & Tỷ lệ SNR (Signal-to-Noise Ratio)
     final activeRms = sortedRms.where((d) => d > noiseFloorDb + 6.0).toList();
@@ -155,14 +168,15 @@ class VoiceAnalyzerService {
 
     if (detectedPitches.isNotEmpty) {
       final sortedPitches = List<double>.from(detectedPitches)..sort();
-      // Loại bỏ 10% ngoại lai hai đầu
-      final int lowIdx = (sortedPitches.length * 0.08).floor();
+      // Loại bỏ ngoại lai hai đầu và lấy TRUNG VỊ (Median) thay vì trung bình cộng
+      // để các âm gió/phụ âm không kéo sai F0 của giọng nam lên thành giọng nữ
+      final int lowIdx = (sortedPitches.length * 0.12).floor();
       final int highIdx =
-          (sortedPitches.length * 0.92).floor().clamp(0, sortedPitches.length - 1);
+          (sortedPitches.length * 0.88).floor().clamp(0, sortedPitches.length - 1);
+      final int medIdx = sortedPitches.length ~/ 2;
       minPitchHz = sortedPitches[lowIdx];
-      maxPitchHz = math.max(minPitchHz + 60.0, sortedPitches[highIdx]);
-      meanPitchHz =
-          detectedPitches.reduce((a, b) => a + b) / detectedPitches.length;
+      maxPitchHz = math.max(minPitchHz + 40.0, sortedPitches[highIdx]);
+      meanPitchHz = sortedPitches[medIdx];
 
       if (detectedPitches.length > 2) {
         double diffSum = 0.0;
@@ -213,12 +227,26 @@ class VoiceAnalyzerService {
     );
   }
 
-  /// Thuật toán YIN Pitch Detection chuẩn xác để đo tần số cơ bản (F0) của giọng người
-  double detectPitchYin(Float64List frame, int sampleRate) {
-    final int halfLen = frame.length ~/ 2;
-    final int minTau = math.max(2, sampleRate ~/ 1050); // Tối đa ~1050Hz
-    final int maxTau = math.min(halfLen - 1, sampleRate ~/ 70); // Tối thiểu ~70Hz
+  /// Thuật toán YIN Pitch Detection chuẩn xác (tích hợp khử DC và kiểm tra chống nhảy bậc 8 - Octave Doubling Check
+  /// dành riêng cho micro điện thoại vốn thường bị yếu tần số trầm F0 của giọng nam).
+  double detectPitchYin(
+    Float64List frame,
+    int sampleRate, {
+    double minFreqHz = 68.0,
+    double maxFreqHz = 950.0,
+  }) {
+    final int len = frame.length;
+    final int halfLen = len ~/ 2;
+    final int minTau = math.max(2, (sampleRate / maxFreqHz).floor());
+    final int maxTau = math.min(halfLen - 1, (sampleRate / minFreqHz).ceil());
     if (minTau >= maxTau) return 0.0;
+
+    // Trừ thành phần 1 chiều (DC Offset) của micro Android để YIN không bị lệch
+    double dcMean = 0.0;
+    for (int i = 0; i < len; i++) {
+      dcMean += frame[i];
+    }
+    dcMean /= len;
 
     final Float64List yinBuffer = Float64List(maxTau + 1);
     double runningSum = 0.0;
@@ -227,14 +255,14 @@ class VoiceAnalyzerService {
     for (int tau = 1; tau <= maxTau; tau++) {
       double diff = 0.0;
       for (int i = 0; i < halfLen; i++) {
-        final double delta = frame[i] - frame[i + tau];
+        final double delta = (frame[i] - dcMean) - (frame[i + tau] - dcMean);
         diff += delta * delta;
       }
       runningSum += diff;
       yinBuffer[tau] = runningSum > 1e-9 ? diff * tau / runningSum : 1.0;
     }
 
-    const double threshold = 0.18;
+    const double threshold = 0.16;
     int bestTau = -1;
     for (int tau = minTau; tau <= maxTau; tau++) {
       if (yinBuffer[tau] < threshold) {
@@ -254,7 +282,29 @@ class VoiceAnalyzerService {
           bestTau = tau;
         }
       }
-      if (minVal > 0.42) return 0.0; // Không phải âm hữu thanh (Unvoiced)
+      // Ngưỡng chặt 0.28 để loại bỏ phụ âm vô thanh (x, ch, t, s)
+      if (minVal > 0.28) return 0.0;
+    }
+
+    // Kiểm tra chống nhảy bậc 8 (Sub-harmonic / Octave-Down Check):
+    // Chỉ chuyển xuống 2*bestTau hoặc 3*bestTau nếu tại đó đáy tuần hoàn thực sự SÂU HƠN đáng kể
+    // so với bestTau (tránh lỗi chia đôi tần số trên sóng sin thuần hoặc giọng nữ chuẩn).
+    for (final int mult in [3, 2]) {
+      final int center = bestTau * mult;
+      if (center + 4 <= maxTau) {
+        int subTau = center;
+        double subMin = yinBuffer[center];
+        for (int t = center - 4; t <= center + 4; t++) {
+          if (yinBuffer[t] < subMin) {
+            subMin = yinBuffer[t];
+            subTau = t;
+          }
+        }
+        if (subMin < yinBuffer[bestTau] - 0.02) {
+          bestTau = subTau;
+          break;
+        }
+      }
     }
 
     // Nội suy Parabolic để đạt độ chính xác dưới 1 Hz
@@ -385,10 +435,18 @@ class VoiceAnalyzerService {
     final s4 = steps.length > 3 ? steps[3] : s1;
 
     final double noiseFloor = s1?.noiseFloorDb ?? -48.0;
-    final double speakingF0 = s1?.meanPitchHz ?? 160.0;
+    // Tổng hợp F0 từ các bước nói/ngân tự nhiên (Bước 1, Bước 3, Bước 4) bằng trung vị để ổn định tuyệt đối
+    final List<double> speakingCandidates = [
+      if (s1 != null) s1.meanPitchHz,
+      if (s3 != null) s3.meanPitchHz,
+      if (s4 != null) s4.meanPitchHz,
+    ]..sort();
+    final double speakingF0 = speakingCandidates.isNotEmpty
+        ? speakingCandidates[speakingCandidates.length ~/ 2]
+        : 155.0;
     final double minPitch = math.min(
-      s1?.minPitchHz ?? 120.0,
-      s2?.minPitchHz ?? 110.0,
+      s1?.minPitchHz ?? 110.0,
+      s2?.minPitchHz ?? 100.0,
     );
     final double maxPitch = math.max(
       s2?.maxPitchHz ?? 420.0,
@@ -396,8 +454,8 @@ class VoiceAnalyzerService {
     );
     final double comfortHz = (speakingF0 * 1.15).clamp(minPitch, maxPitch);
 
-    // Phân loại quãng giọng dựa trên F0 trung bình và quãng giọng
-    final VocalRangeType vocalType = _classifyVocalRange(speakingF0, maxPitch);
+    // Phân loại quãng giọng dựa trên F0 trung vị khi nói và đáy trầm minPitch
+    final VocalRangeType vocalType = _classifyVocalRange(speakingF0, minPitch, maxPitch);
 
     // Tính đường cong bù trừ 5-Band EQ tự động từ trung bình tất cả các bước đã đo
     final List<double> measuredBands = List<double>.filled(5, 0.0);
@@ -450,10 +508,17 @@ class VoiceAnalyzerService {
     );
   }
 
-  VocalRangeType _classifyVocalRange(double speakingF0, double maxPitch) {
+  VocalRangeType _classifyVocalRange(
+    double speakingF0,
+    double minPitch,
+    double maxPitch,
+  ) {
     if (speakingF0 < 115.0) return VocalRangeType.bass;
     if (speakingF0 < 155.0) return VocalRangeType.baritone;
-    if (speakingF0 < 190.0) return VocalRangeType.tenor;
+    // Vùng chuyển tiếp 155-185Hz: nếu minPitch xuống dưới 130Hz chắc chắn là giọng Nam (Tenor)
+    if (speakingF0 < 180.0 || (speakingF0 < 195.0 && minPitch < 130.0)) {
+      return VocalRangeType.tenor;
+    }
     if (speakingF0 < 225.0) return VocalRangeType.alto;
     if (speakingF0 < 260.0 || maxPitch < 750.0) {
       return VocalRangeType.mezzoSoprano;
