@@ -1,7 +1,7 @@
 name: audio_auto
-description: "VocalAI Karaoke Studio - On-Device Voice Profiling & Karaoke DSP."
+description: "Sonca Autotune - On-Device AI Voice Profiling & Karaoke DSP."
 publish_to: 'none'
-version: 1.0.0+1
+version: 1.0.0+1000
 
 environment:
   sdk: ^3.12.2

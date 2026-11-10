@@ -33,7 +33,7 @@ class _AudioAutoKaraokeAppState extends State<AudioAutoKaraokeApp> {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'VocalAI Karaoke Studio',
+      title: 'Sonca Autotune',
       debugShowCheckedModeBanner: false,
       theme: AppTheme.darkStudioTheme,
       home: HomeScreen(controller: _controller),
